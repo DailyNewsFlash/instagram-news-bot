@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests anthropic pillow instagrapi
+          pip install requests pillow instagrapi
 
       - name: Run bot
         env:
