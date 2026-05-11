@@ -2,12 +2,12 @@ name: Instagram News Bot
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # 9:30 AM IST
-    - cron: '0 7 * * *'    # 12:30 PM IST
-    - cron: '0 10 * * *'   # 3:30 PM IST
-    - cron: '0 13 * * *'   # 6:30 PM IST
-    - cron: '0 16 * * *'   # 9:30 PM IST
-  workflow_dispatch:         # lets you run it manually too
+    - cron: '0 4 * * *'
+    - cron: '0 7 * * *'
+    - cron: '0 10 * * *'
+    - cron: '0 13 * * *'
+    - cron: '0 16 * * *'
+  workflow_dispatch:
 
 jobs:
   post:
@@ -28,7 +28,7 @@ jobs:
         env:
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
           INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
         run: python bot.py
