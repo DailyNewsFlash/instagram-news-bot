@@ -1,17 +1,15 @@
 import os
 import requests
-import anthropic
 from PIL import Image, ImageDraw, ImageFont
 from instagrapi import Client
 import textwrap
-import json
 from datetime import datetime
 import random
 
 # ── API keys from GitHub Secrets ──────────────────────────────────────────────
 GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"]
 UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"]
 INSTAGRAM_USERNAME  = os.environ["INSTAGRAM_USERNAME"]
 INSTAGRAM_PASSWORD  = os.environ["INSTAGRAM_PASSWORD"]
 
@@ -22,7 +20,7 @@ def fetch_news():
     params = {
         "token": GNEWS_API_KEY,
         "lang": "en",
-        "country": "in",   # India news — change to 'us' for world news
+        "country": "in",
         "max": 10,
         "topic": "breaking-news"
     }
@@ -32,15 +30,14 @@ def fetch_news():
     if not articles:
         print("No articles found.")
         return None
-    # Pick a random article from the top 10 so we don't repeat the same one
     article = random.choice(articles)
     print(f"Selected article: {article['title']}")
     return article
 
-# ── 2. Generate Instagram caption using Claude ────────────────────────────────
+# ── 2. Generate caption using Google Gemini (free, no credit card) ────────────
 def generate_caption(article):
-    print("Generating caption with Claude...")
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    print("Generating caption with Gemini...")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""
 You are a professional Instagram news content creator for the account @dailynewsflash_in.
 
@@ -54,22 +51,27 @@ Published: {article['publishedAt']}
 Requirements:
 - Start with a strong hook (1 sentence that grabs attention)
 - Summarize the news clearly in 2-3 sentences
-- Mention the source like: "Source: {article['source']['name']}"
-- End with a call to action: ask followers to comment their thoughts and follow @dailynewsflash_in for more
-- Add 15-20 relevant hashtags at the end
+- Mention the source like: Source: {article['source']['name']}
+- End with: Comment your thoughts below and follow @dailynewsflash_in for daily news updates!
+- Add 15 relevant hashtags at the end
 - Keep total length under 2000 characters
 - Use line breaks to make it readable
 - Add relevant emojis to make it visually engaging
-- Do NOT make up any facts — only use what is in the title and description above
+- Do NOT make up any facts - only use what is in the title and description above
 """
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    caption = message.content[0].text
-    print("Caption generated successfully.")
-    return caption
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    response = requests.post(url, json=payload)
+    data = response.json()
+    try:
+        caption = data["candidates"][0]["content"]["parts"][0]["text"]
+        print("Caption generated successfully.")
+        return caption
+    except Exception as e:
+        print(f"Caption generation error: {e}")
+        print(f"Response: {data}")
+        return f"{article['title']}\n\nSource: {article['source']['name']}\n\nFollow @dailynewsflash_in for more news!\n\n#news #breakingnews #india #dailynews #newsupdates"
 
 # ── 3. Fetch a relevant image from Unsplash ───────────────────────────────────
 def fetch_image(keyword):
@@ -90,7 +92,6 @@ def fetch_image(keyword):
     photo = random.choice(results[:5])
     image_url = photo["urls"]["regular"]
     photographer = photo["user"]["name"]
-    # Download the image
     img_response = requests.get(image_url, stream=True)
     image_path = "/tmp/news_image.jpg"
     with open(image_path, "wb") as f:
@@ -110,43 +111,33 @@ def create_post_image(image_path, headline, source_name):
     else:
         img = Image.new("RGB", img_size, color=(20, 20, 40))
 
-    draw = ImageDraw.Draw(img)
-
-    # Dark overlay at bottom for text readability
     overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rectangle([(0, 600), (1080, 1080)], fill=(0, 0, 0, 180))
-    overlay_draw.rectangle([(0, 0), (1080, 80)], fill=(0, 0, 0, 150))
+    overlay_draw.rectangle([(0, 580), (1080, 1080)], fill=(0, 0, 0, 185))
+    overlay_draw.rectangle([(0, 0), (1080, 85)], fill=(0, 0, 0, 160))
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Try to load a font, fall back to default if not available
     try:
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
-        font_brand = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
+        font_brand = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34)
     except:
         font_large = ImageFont.load_default()
         font_small = font_large
         font_brand = font_large
 
-    # Brand name at top
-    draw.text((40, 22), "@dailynewsflash_in", font=font_brand, fill=(255, 200, 50))
+    draw.text((40, 24), "@dailynewsflash_in", font=font_brand, fill=(255, 200, 50))
+    draw.text((40, 610), f"Source: {source_name}", font=font_small, fill=(120, 200, 255))
 
-    # Source badge
-    source_text = f"Source: {source_name}"
-    draw.text((40, 620), source_text, font=font_small, fill=(150, 220, 255))
-
-    # Wrap and draw headline
-    wrapped = textwrap.wrap(headline, width=28)
-    y = 680
-    for line in wrapped[:4]:   # max 4 lines
+    wrapped = textwrap.wrap(headline, width=30)
+    y = 668
+    for line in wrapped[:4]:
         draw.text((40, y), line, font=font_large, fill=(255, 255, 255))
-        y += 65
+        y += 62
 
-    # Bottom bar
-    draw.rectangle([(0, 1020), (1080, 1080)], fill=(20, 20, 20))
-    draw.text((40, 1032), "Follow for daily news updates", font=font_small, fill=(180, 180, 180))
+    draw.rectangle([(0, 1020), (1080, 1080)], fill=(15, 15, 15))
+    draw.text((40, 1034), "Follow @dailynewsflash_in for daily updates", font=font_small, fill=(180, 180, 180))
 
     output_path = "/tmp/final_post.jpg"
     img.save(output_path, "JPEG", quality=95)
@@ -157,7 +148,7 @@ def create_post_image(image_path, headline, source_name):
 def post_to_instagram(image_path, caption):
     print("Logging into Instagram...")
     cl = Client()
-    cl.delay_range = [2, 5]   # polite delay between actions
+    cl.delay_range = [2, 5]
     cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
     print("Uploading post...")
     cl.photo_upload(image_path, caption)
@@ -172,9 +163,8 @@ def main():
         print("No article found. Exiting.")
         return
 
-    caption    = generate_caption(article)
-    keyword    = article["title"].split()[0:3]
-    keyword    = " ".join(keyword)
+    caption     = generate_caption(article)
+    keyword     = " ".join(article["title"].split()[:3])
     image_path, photographer = fetch_image(keyword)
     final_image = create_post_image(image_path, article["title"], article["source"]["name"])
     post_to_instagram(final_image, caption)
