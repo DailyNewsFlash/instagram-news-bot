@@ -70,7 +70,6 @@ Requirements:
         return caption
     except Exception as e:
         print(f"Caption generation error: {e}")
-        print(f"Response: {data}")
         return f"{article['title']}\n\nSource: {article['source']['name']}\n\nFollow @dailynewsflash_in for more news!\n\n#news #breakingnews #india #dailynews #newsupdates"
 
 # ── 3. Fetch a relevant image from Unsplash ───────────────────────────────────
@@ -148,8 +147,25 @@ def create_post_image(image_path, headline, source_name):
 def post_to_instagram(image_path, caption):
     print("Logging into Instagram...")
     cl = Client()
+    cl.set_device({
+        "app_version": "269.0.0.18.75",
+        "android_version": 26,
+        "android_release": "8.0.0",
+        "dpi": "480dpi",
+        "resolution": "1080x1920",
+        "manufacturer": "OnePlus",
+        "device": "ONEPLUS A3010",
+        "model": "OnePlus3T",
+        "cpu": "qcom",
+        "version_code": "314665256"
+    })
     cl.delay_range = [2, 5]
-    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+    try:
+        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        print("Logged in successfully.")
+    except Exception as e:
+        print(f"Login error: {e}")
+        raise
     print("Uploading post...")
     cl.photo_upload(image_path, caption)
     print("Post uploaded successfully!")
