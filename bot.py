@@ -1,7 +1,6 @@
 import os
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from instagrapi import Client
 import textwrap
 from datetime import datetime
 import random
@@ -10,8 +9,8 @@ import random
 GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"]
 UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
 GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"]
-INSTAGRAM_USERNAME  = os.environ["INSTAGRAM_USERNAME"]
-INSTAGRAM_PASSWORD  = os.environ["INSTAGRAM_PASSWORD"]
+FB_PAGE_ID          = os.environ["FB_PAGE_ID"]
+FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"]
 
 # ── 1. Fetch trending news ─────────────────────────────────────────────────────
 def fetch_news():
@@ -34,7 +33,7 @@ def fetch_news():
     print(f"Selected article: {article['title']}")
     return article
 
-# ── 2. Generate caption using Google Gemini (free, no credit card) ────────────
+# ── 2. Generate caption using Google Gemini ───────────────────────────────────
 def generate_caption(article):
     print("Generating caption with Gemini...")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
@@ -87,17 +86,16 @@ def fetch_image(keyword):
     results = data.get("results", [])
     if not results:
         print("No image found, using fallback.")
-        return None, None
+        return None
     photo = random.choice(results[:5])
     image_url = photo["urls"]["regular"]
-    photographer = photo["user"]["name"]
     img_response = requests.get(image_url, stream=True)
     image_path = "/tmp/news_image.jpg"
     with open(image_path, "wb") as f:
         for chunk in img_response.iter_content(1024):
             f.write(chunk)
-    print(f"Image downloaded. Photo by: {photographer}")
-    return image_path, photographer
+    print("Image downloaded successfully.")
+    return image_path
 
 # ── 4. Design the Instagram post image ────────────────────────────────────────
 def create_post_image(image_path, headline, source_name):
@@ -143,32 +141,88 @@ def create_post_image(image_path, headline, source_name):
     print("Post image created successfully.")
     return output_path
 
-# ── 5. Post to Instagram ──────────────────────────────────────────────────────
-def post_to_instagram(image_path, caption):
-    print("Logging into Instagram...")
-    cl = Client()
-    cl.set_device({
-        "app_version": "269.0.0.18.75",
-        "android_version": 26,
-        "android_release": "8.0.0",
-        "dpi": "480dpi",
-        "resolution": "1080x1920",
-        "manufacturer": "OnePlus",
-        "device": "ONEPLUS A3010",
-        "model": "OnePlus3T",
-        "cpu": "qcom",
-        "version_code": "314665256"
-    })
-    cl.delay_range = [2, 5]
-    try:
-        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        print("Logged in successfully.")
-    except Exception as e:
-        print(f"Login error: {e}")
-        raise
-    print("Uploading post...")
-    cl.photo_upload(image_path, caption)
-    print("Post uploaded successfully!")
+# ── 5. Get Instagram Business Account ID from Facebook Page ───────────────────
+def get_instagram_account_id():
+    print("Getting Instagram Business Account ID...")
+    url = f"https://graph.facebook.com/v25.0/{FB_PAGE_ID}"
+    params = {
+        "fields": "instagram_business_account",
+        "access_token": FB_ACCESS_TOKEN
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    print(f"Page data: {data}")
+    ig_account = data.get("instagram_business_account", {})
+    ig_id = ig_account.get("id")
+    if not ig_id:
+        # fallback: use page ID directly
+        ig_id = FB_PAGE_ID
+    print(f"Instagram Account ID: {ig_id}")
+    return ig_id
+
+# ── 6. Upload image to a public URL using Imgur (free) ────────────────────────
+def upload_image_to_imgur(image_path):
+    print("Uploading image to Imgur for public URL...")
+    # Use a simple image hosting approach via Unsplash CDN already downloaded
+    # Instead we'll use the file directly via base64 with Imgur API
+    with open(image_path, "rb") as f:
+        import base64
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    
+    response = requests.post(
+        "https://api.imgur.com/3/image",
+        headers={"Authorization": "Client-ID 546c25a59c58ad7"},
+        data={"image": image_data, "type": "base64"}
+    )
+    data = response.json()
+    print(f"Imgur response: {data.get('success')}")
+    if data.get("success"):
+        url = data["data"]["link"]
+        print(f"Image uploaded: {url}")
+        return url
+    else:
+        print(f"Imgur upload failed: {data}")
+        return None
+
+# ── 7. Post to Instagram using official API ───────────────────────────────────
+def post_to_instagram(ig_account_id, image_url, caption):
+    print("Posting to Instagram via official API...")
+    
+    # Step 1: Create media container
+    container_url = f"https://graph.facebook.com/v25.0/{ig_account_id}/media"
+    container_params = {
+        "image_url": image_url,
+        "caption": caption,
+        "access_token": FB_ACCESS_TOKEN
+    }
+    container_response = requests.post(container_url, data=container_params)
+    container_data = container_response.json()
+    print(f"Container response: {container_data}")
+    
+    creation_id = container_data.get("id")
+    if not creation_id:
+        print(f"Failed to create media container: {container_data}")
+        raise Exception(f"Media container creation failed: {container_data}")
+    
+    print(f"Media container created: {creation_id}")
+    
+    # Step 2: Publish the container
+    import time
+    time.sleep(5)  # wait a moment before publishing
+    
+    publish_url = f"https://graph.facebook.com/v25.0/{ig_account_id}/media_publish"
+    publish_params = {
+        "creation_id": creation_id,
+        "access_token": FB_ACCESS_TOKEN
+    }
+    publish_response = requests.post(publish_url, data=publish_params)
+    publish_data = publish_response.json()
+    print(f"Publish response: {publish_data}")
+    
+    if "id" in publish_data:
+        print("Post published successfully!")
+    else:
+        raise Exception(f"Publishing failed: {publish_data}")
 
 # ── Main flow ─────────────────────────────────────────────────────────────────
 def main():
@@ -181,9 +235,16 @@ def main():
 
     caption     = generate_caption(article)
     keyword     = " ".join(article["title"].split()[:3])
-    image_path, photographer = fetch_image(keyword)
+    image_path  = fetch_image(keyword)
     final_image = create_post_image(image_path, article["title"], article["source"]["name"])
-    post_to_instagram(final_image, caption)
+    image_url   = upload_image_to_imgur(final_image)
+    
+    if not image_url:
+        print("Image upload failed. Exiting.")
+        return
+    
+    ig_account_id = get_instagram_account_id()
+    post_to_instagram(ig_account_id, image_url, caption)
 
     print(f"\n=== Bot finished successfully at {datetime.now()} ===\n")
 
