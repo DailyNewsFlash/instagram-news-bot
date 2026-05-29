@@ -4,6 +4,8 @@ from PIL import Image, ImageDraw, ImageFont
 import textwrap
 from datetime import datetime
 import random
+import base64
+import time
 
 # ── API keys from GitHub Secrets ──────────────────────────────────────────────
 GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"]
@@ -11,6 +13,7 @@ UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
 GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"]
 FB_PAGE_ID          = os.environ["FB_PAGE_ID"]
 FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"]
+IG_ACCOUNT_ID       = os.environ["IG_ACCOUNT_ID"]
 
 # ── 1. Fetch trending news ─────────────────────────────────────────────────────
 def fetch_news():
@@ -58,9 +61,7 @@ Requirements:
 - Add relevant emojis to make it visually engaging
 - Do NOT make up any facts - only use what is in the title and description above
 """
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     response = requests.post(url, json=payload)
     data = response.json()
     try:
@@ -101,20 +102,17 @@ def fetch_image(keyword):
 def create_post_image(image_path, headline, source_name):
     print("Designing the post image...")
     img_size = (1080, 1080)
-
     if image_path:
         img = Image.open(image_path).convert("RGB")
         img = img.resize(img_size, Image.LANCZOS)
     else:
         img = Image.new("RGB", img_size, color=(20, 20, 40))
-
     overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
     overlay_draw.rectangle([(0, 580), (1080, 1080)], fill=(0, 0, 0, 185))
     overlay_draw.rectangle([(0, 0), (1080, 85)], fill=(0, 0, 0, 160))
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
-
     try:
         font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
@@ -123,59 +121,31 @@ def create_post_image(image_path, headline, source_name):
         font_large = ImageFont.load_default()
         font_small = font_large
         font_brand = font_large
-
     draw.text((40, 24), "@dailynewsflash_in", font=font_brand, fill=(255, 200, 50))
     draw.text((40, 610), f"Source: {source_name}", font=font_small, fill=(120, 200, 255))
-
     wrapped = textwrap.wrap(headline, width=30)
     y = 668
     for line in wrapped[:4]:
         draw.text((40, y), line, font=font_large, fill=(255, 255, 255))
         y += 62
-
     draw.rectangle([(0, 1020), (1080, 1080)], fill=(15, 15, 15))
     draw.text((40, 1034), "Follow @dailynewsflash_in for daily updates", font=font_small, fill=(180, 180, 180))
-
     output_path = "/tmp/final_post.jpg"
     img.save(output_path, "JPEG", quality=95)
     print("Post image created successfully.")
     return output_path
 
-# ── 5. Get Instagram Business Account ID from Facebook Page ───────────────────
-def get_instagram_account_id():
-    print("Getting Instagram Business Account ID...")
-    url = f"https://graph.facebook.com/v25.0/{FB_PAGE_ID}"
-    params = {
-        "fields": "instagram_business_account",
-        "access_token": FB_ACCESS_TOKEN
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
-    print(f"Page data: {data}")
-    ig_account = data.get("instagram_business_account", {})
-    ig_id = ig_account.get("id")
-    if not ig_id:
-        # fallback: use page ID directly
-        ig_id = FB_PAGE_ID
-    print(f"Instagram Account ID: {ig_id}")
-    return ig_id
-
-# ── 6. Upload image to a public URL using Imgur (free) ────────────────────────
+# ── 5. Upload image to Imgur ──────────────────────────────────────────────────
 def upload_image_to_imgur(image_path):
-    print("Uploading image to Imgur for public URL...")
-    # Use a simple image hosting approach via Unsplash CDN already downloaded
-    # Instead we'll use the file directly via base64 with Imgur API
+    print("Uploading image to Imgur...")
     with open(image_path, "rb") as f:
-        import base64
         image_data = base64.b64encode(f.read()).decode("utf-8")
-    
     response = requests.post(
         "https://api.imgur.com/3/image",
         headers={"Authorization": "Client-ID 546c25a59c58ad7"},
         data={"image": image_data, "type": "base64"}
     )
     data = response.json()
-    print(f"Imgur response: {data.get('success')}")
     if data.get("success"):
         url = data["data"]["link"]
         print(f"Image uploaded: {url}")
@@ -184,12 +154,13 @@ def upload_image_to_imgur(image_path):
         print(f"Imgur upload failed: {data}")
         return None
 
-# ── 7. Post to Instagram using official API ───────────────────────────────────
-def post_to_instagram(ig_account_id, image_url, caption):
+# ── 6. Post to Instagram using official API ───────────────────────────────────
+def post_to_instagram(image_url, caption):
     print("Posting to Instagram via official API...")
-    
+    print(f"Using IG Account ID: {IG_ACCOUNT_ID}")
+
     # Step 1: Create media container
-    container_url = f"https://graph.facebook.com/v25.0/{ig_account_id}/media"
+    container_url = f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media"
     container_params = {
         "image_url": image_url,
         "caption": caption,
@@ -198,19 +169,16 @@ def post_to_instagram(ig_account_id, image_url, caption):
     container_response = requests.post(container_url, data=container_params)
     container_data = container_response.json()
     print(f"Container response: {container_data}")
-    
+
     creation_id = container_data.get("id")
     if not creation_id:
-        print(f"Failed to create media container: {container_data}")
         raise Exception(f"Media container creation failed: {container_data}")
-    
+
     print(f"Media container created: {creation_id}")
-    
+    time.sleep(5)
+
     # Step 2: Publish the container
-    import time
-    time.sleep(5)  # wait a moment before publishing
-    
-    publish_url = f"https://graph.facebook.com/v25.0/{ig_account_id}/media_publish"
+    publish_url = f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish"
     publish_params = {
         "creation_id": creation_id,
         "access_token": FB_ACCESS_TOKEN
@@ -218,7 +186,7 @@ def post_to_instagram(ig_account_id, image_url, caption):
     publish_response = requests.post(publish_url, data=publish_params)
     publish_data = publish_response.json()
     print(f"Publish response: {publish_data}")
-    
+
     if "id" in publish_data:
         print("Post published successfully!")
     else:
@@ -238,13 +206,12 @@ def main():
     image_path  = fetch_image(keyword)
     final_image = create_post_image(image_path, article["title"], article["source"]["name"])
     image_url   = upload_image_to_imgur(final_image)
-    
+
     if not image_url:
         print("Image upload failed. Exiting.")
         return
-    
-    ig_account_id = get_instagram_account_id()
-    post_to_instagram(ig_account_id, image_url, caption)
+
+    post_to_instagram(image_url, caption)
 
     print(f"\n=== Bot finished successfully at {datetime.now()} ===\n")
 
