@@ -41,25 +41,41 @@ def generate_caption(article):
     print("Generating caption with Gemini...")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""
-You are a professional Instagram news content creator for the account @dailynewsflash_in.
+You are an expert Instagram news content creator for @dailynewsflash_in — a professional Indian news page.
 
-Write an engaging Instagram post caption for this news article:
+Write a highly engaging Instagram post caption for this news article:
 
 Title: {article['title']}
 Description: {article.get('description', '')}
 Source: {article['source']['name']}
 Published: {article['publishedAt']}
 
-Requirements:
-- Start with a strong hook (1 sentence that grabs attention)
-- Summarize the news clearly in 2-3 sentences
-- Mention the source like: Source: {article['source']['name']}
-- End with: Comment your thoughts below and follow @dailynewsflash_in for daily news updates!
-- Add 15 relevant hashtags at the end
-- Keep total length under 2000 characters
-- Use line breaks to make it readable
-- Add relevant emojis to make it visually engaging
-- Do NOT make up any facts - only use what is in the title and description above
+Follow this EXACT structure:
+
+1. 🔴 BREAKING or 📰 NEWS (use relevant emoji) — one powerful hook sentence that makes people stop scrolling
+
+2. Write 4-5 sentences explaining the full story in simple language:
+   - What happened?
+   - Who is involved?
+   - Why does it matter to common people?
+   - What happens next?
+
+3. Write one line with your own analysis or interesting angle on this news
+
+4. Source line: 📌 Source: {article['source']['name']}
+
+5. Call to action: 
+💬 What do you think about this? Drop your thoughts in the comments!
+👉 Follow @dailynewsflash_in for breaking news every day!
+
+6. Add 20 highly relevant hashtags mixing English and Hindi news hashtags
+
+Important rules:
+- Write in a conversational, easy to understand tone
+- Use emojis throughout to make it visually engaging
+- Keep total length between 1500-2000 characters
+- Do NOT make up any facts — only use what is in the title and description
+- Make it feel like a real news journalist wrote it
 """
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     response = requests.post(url, json=payload)
@@ -70,7 +86,7 @@ Requirements:
         return caption
     except Exception as e:
         print(f"Caption generation error: {e}")
-        return f"{article['title']}\n\nSource: {article['source']['name']}\n\nFollow @dailynewsflash_in for more news!\n\n#news #breakingnews #india #dailynews #newsupdates"
+        return f"📰 {article['title']}\n\n{article.get('description', '')}\n\n📌 Source: {article['source']['name']}\n\n💬 What do you think? Comment below!\n👉 Follow @dailynewsflash_in for daily news!\n\n#news #breakingnews #india #dailynews #newsupdates #indianews #latestnews #todaynews #newsupdate #hindinews"
 
 # ── 3. Fetch a relevant image from Unsplash ───────────────────────────────────
 def fetch_image(keyword):
