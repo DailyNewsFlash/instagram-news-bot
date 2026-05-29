@@ -64,7 +64,7 @@ Follow this EXACT structure:
 
 4. Source line: 📌 Source: {article['source']['name']}
 
-5. Call to action: 
+5. Call to action:
 💬 What do you think about this? Drop your thoughts in the comments!
 👉 Follow @dailynewsflash_in for breaking news every day!
 
@@ -86,9 +86,37 @@ Important rules:
         return caption
     except Exception as e:
         print(f"Caption generation error: {e}")
-        return f"📰 {article['title']}\n\n{article.get('description', '')}\n\n📌 Source: {article['source']['name']}\n\n💬 What do you think? Comment below!\n👉 Follow @dailynewsflash_in for daily news!\n\n#news #breakingnews #india #dailynews #newsupdates #indianews #latestnews #todaynews #newsupdate #hindinews"
+        return f"📰 {article['title']}\n\n{article.get('description', '')}\n\n📌 Source: {article['source']['name']}\n\n💬 What do you think? Comment below!\n👉 Follow @dailynewsflash_in for daily news!\n\n#news #breakingnews #india #dailynews #newsupdates"
 
-# ── 3. Fetch a relevant image from Unsplash ───────────────────────────────────
+# ── 3. Get smart image keyword using Gemini ───────────────────────────────────
+def get_image_keyword(article):
+    print("Getting smart image keyword...")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    prompt = f"""
+Given this news headline: "{article['title']}"
+
+Give me ONE short generic search keyword (2-3 words max) that would find a relevant, 
+visually appealing stock photo on Unsplash for this news story.
+
+Rules:
+- Use generic visual concepts, NOT specific names of people or events
+- Examples: "chess game board", "supreme court building", "ambulance emergency", 
+  "parliament building india", "cricket stadium", "stock market graph", 
+  "protest crowd", "military soldiers", "election voting"
+- Return ONLY the keyword, nothing else, no quotes, no explanation
+
+Keyword:"""
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    response = requests.post(url, json=payload)
+    data = response.json()
+    try:
+        keyword = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print(f"Smart keyword: {keyword}")
+        return keyword
+    except:
+        return "india news"
+
+# ── 4. Fetch a relevant image from Unsplash ───────────────────────────────────
 def fetch_image(keyword):
     print(f"Fetching image for keyword: {keyword}")
     url = "https://api.unsplash.com/search/photos"
@@ -102,7 +130,13 @@ def fetch_image(keyword):
     data = response.json()
     results = data.get("results", [])
     if not results:
-        print("No image found, using fallback.")
+        print("No image found for keyword, trying fallback: india news")
+        params["query"] = "india news"
+        response = requests.get(url, params=params)
+        data = response.json()
+        results = data.get("results", [])
+    if not results:
+        print("No image found at all.")
         return None
     photo = random.choice(results[:5])
     image_url = photo["urls"]["regular"]
@@ -114,7 +148,7 @@ def fetch_image(keyword):
     print("Image downloaded successfully.")
     return image_path
 
-# ── 4. Design the Instagram post image ────────────────────────────────────────
+# ── 5. Design the Instagram post image ────────────────────────────────────────
 def create_post_image(image_path, headline, source_name):
     print("Designing the post image...")
     img_size = (1080, 1080)
@@ -151,7 +185,7 @@ def create_post_image(image_path, headline, source_name):
     print("Post image created successfully.")
     return output_path
 
-# ── 5. Upload image to Imgur ──────────────────────────────────────────────────
+# ── 6. Upload image to Imgur ──────────────────────────────────────────────────
 def upload_image_to_imgur(image_path):
     print("Uploading image to Imgur...")
     with open(image_path, "rb") as f:
@@ -170,12 +204,11 @@ def upload_image_to_imgur(image_path):
         print(f"Imgur upload failed: {data}")
         return None
 
-# ── 6. Post to Instagram using official API ───────────────────────────────────
+# ── 7. Post to Instagram using official API ───────────────────────────────────
 def post_to_instagram(image_url, caption):
     print("Posting to Instagram via official API...")
     print(f"Using IG Account ID: {IG_ACCOUNT_ID}")
 
-    # Step 1: Create media container
     container_url = f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media"
     container_params = {
         "image_url": image_url,
@@ -193,7 +226,6 @@ def post_to_instagram(image_url, caption):
     print(f"Media container created: {creation_id}")
     time.sleep(5)
 
-    # Step 2: Publish the container
     publish_url = f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish"
     publish_params = {
         "creation_id": creation_id,
@@ -218,7 +250,7 @@ def main():
         return
 
     caption     = generate_caption(article)
-    keyword     = " ".join(article["title"].split()[:3])
+    keyword     = get_image_keyword(article)
     image_path  = fetch_image(keyword)
     final_image = create_post_image(image_path, article["title"], article["source"]["name"])
     image_url   = upload_image_to_imgur(final_image)
