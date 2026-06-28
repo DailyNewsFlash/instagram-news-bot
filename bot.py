@@ -529,16 +529,30 @@ Source: {article['source']['name']}
 
 Caption structure:
 1. ONE punchy hook line with the most shocking/controversial angle — use 🔴 or 🚨 or ⚡
-2. 4-5 sentences covering: what happened, who is involved, what is at stake, why Indians should care
-3. The CONTROVERSY angle — what are people fighting about? Who is right? Who is wrong?
-4. One sentence with your hot take using Indian slang: "Yaar", "bhai", "sach mein", "desh ke log"
-5. 📌 Source: {article['source']['name']}
-6. 💬 What's YOUR take? Drop your opinion below 👇
-   Don't hold back — tell us what you really think!
-7. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
-8. 25 relevant hashtags (mix of English and Hindi hashtags)
 
-Rules: Facts only. Conversational. Emojis throughout. 1800-2200 chars. Make people WANT to comment."""
+2. 📖 WHAT HAPPENED — 3 to 4 clear sentences explaining the story in simple language:
+   - What exactly happened?
+   - Who is involved (people, organisations, government)?
+   - When and where did this happen?
+   - What has been the immediate reaction or consequence?
+   Write this like you are explaining to a friend who just woke up and knows nothing about it.
+
+3. 🤔 WHY IT MATTERS — 2 sentences on why every Indian should care about this.
+
+4. 🔥 THE CONTROVERSY — 1-2 sentences on what people are arguing about. Who is right? Who is wrong?
+
+5. One sentence hot take using Indian slang: "Yaar", "bhai", "sach mein", "desh ke log"
+
+6. 📌 Source: {article['source']['name']}
+
+7. 💬 What's YOUR take? Drop your opinion below 👇
+   Don't hold back — tell us what you really think!
+
+8. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
+
+9. 25 relevant hashtags (mix of English and Hindi hashtags like #India #BreakingNews #ISRO etc.)
+
+Rules: Facts only, no made-up details. Conversational tone. Emojis throughout. 1800-2200 chars total."""
 
     caption = call_gemini(prompt)
     if caption:
