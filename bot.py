@@ -9,7 +9,7 @@ import time
 import sys
 from urllib.parse import quote
 
-# ── API keys from GitHub Secrets ──────────────────────────────────────────────
+# ── API keys ──────────────────────────────────────────────────────────────────
 GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"]
 UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
 GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"]
@@ -20,7 +20,7 @@ PEXELS_API_KEY      = os.environ.get("PEXELS_API_KEY", "")
 PIXABAY_API_KEY     = os.environ.get("PIXABAY_API_KEY", "")
 POST_TYPE           = os.environ.get("POST_TYPE", "single")
 
-# ── High-engagement, controversy-driving topics ───────────────────────────────
+# ── Topics ────────────────────────────────────────────────────────────────────
 TRENDING_TOPICS = [
     "India government policy controversy",
     "India Supreme Court verdict",
@@ -34,8 +34,6 @@ TRENDING_TOPICS = [
     "India vs Pakistan news",
     "Narendra Modi government decision",
     "India unemployment jobs",
-    "India rape crime justice",
-    "India farmer protest",
     "India army military",
     "ISRO space India",
     "India startup unicorn",
@@ -44,696 +42,585 @@ TRENDING_TOPICS = [
     "India education system",
 ]
 
-# ── Gemini API call with retry ────────────────────────────────────────────────
-def call_gemini(prompt, retries=3):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+# ── Gemini: smart rate-limit handling with model fallbacks ────────────────────
+# Free tier limits: 15 req/min on 2.0-flash, 15 req/min on 1.5-flash
+# We add delays between calls to stay well under the limit
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
+_last_gemini_call = 0   # track time of last call globally
+
+def call_gemini(prompt, retries=2):
+    global _last_gemini_call
+    # Always wait at least 5 seconds between Gemini calls to avoid rate limits
+    elapsed = time.time() - _last_gemini_call
+    if elapsed < 5:
+        time.sleep(5 - elapsed)
+
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload, timeout=25)
-            data = response.json()
-            if "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            print(f"Gemini attempt {attempt+1} failed: {data.get('error', {}).get('message', data)}")
-        except Exception as e:
-            print(f"Gemini attempt {attempt+1} error: {e}")
-        time.sleep(3)
+
+    for model in GEMINI_MODELS:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={GEMINI_API_KEY}")
+        for attempt in range(retries):
+            try:
+                _last_gemini_call = time.time()
+                resp = requests.post(url, json=payload, timeout=30)
+                data = resp.json()
+                if "candidates" in data:
+                    print(f"Gemini OK ({model})")
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                err_msg = data.get("error", {}).get("message", "")
+                err_code = data.get("error", {}).get("code", 0)
+                if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
+                    wait = 35 + (attempt * 30)
+                    print(f"Rate limit on {model}, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue    # retry same model after wait
+                else:
+                    print(f"Gemini {model} error: {err_msg}")
+                    break       # non-rate error → try next model
+            except Exception as e:
+                print(f"Gemini {model} exception: {e}")
+                time.sleep(5)
+
+    print("All Gemini models failed — using rule-based fallback")
     return None
 
-# ── Fetch articles ─────────────────────────────────────────────────────────────
+
+# ── ONE combined Gemini call per article (saves quota) ────────────────────────
+def analyse_article(article, post_type="single"):
+    """
+    Single Gemini call that returns:
+      - photo_keyword   : best stock-photo search term
+      - ai_image_prompt : Pollinations AI image prompt
+      - caption         : full Instagram caption
+    All in one call to minimise quota usage.
+    """
+    title = article["title"]
+    desc  = article.get("description", "")[:300]
+    src   = article["source"]["name"]
+    topic = article.get("_topic", "general")
+
+    if post_type == "carousel":
+        caption_instruction = f"""CAPTION (carousel slide summary):
+Write 2-3 punchy sentences summarising this story for a carousel slide.
+End with: 📌 {src}"""
+    else:
+        caption_instruction = f"""CAPTION (full single-post caption):
+Structure:
+1. ONE punchy hook — 🔴 or 🚨 or ⚡ — the most shocking/controversial angle
+2. 📖 WHAT HAPPENED — 3-4 clear sentences: what, who, where, when, consequence
+3. 🤔 WHY IT MATTERS — 2 sentences why every Indian should care
+4. 🔥 THE CONTROVERSY — 1-2 sentences on what people argue about
+5. One hot-take line using Indian slang: "Yaar", "bhai", "sach mein"
+6. 📌 Source: {src}
+7. 💬 What's YOUR take? Drop your opinion below 👇 Don't hold back!
+8. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
+9. 25 relevant hashtags (English + Hindi)
+Rules: facts only, conversational, emojis throughout, 1800-2200 chars, make people WANT to comment."""
+
+    prompt = f"""You are an expert Indian news Instagram editor.
+Analyse this news article and return EXACTLY three sections labelled as shown.
+
+Article title: {title}
+Description: {desc}
+Source: {src}
+Topic category: {topic}
+
+---
+PHOTO_KEYWORD:
+Give ONE specific 3-5 word stock photo search term that visually matches this story.
+NEVER use: india flag, indian flag, india map, indian crowd generic.
+Be literal: "cricket stadium night lights", "supreme court building pillars",
+"protest crowd city street", "rocket launch fire smoke", "flooded village rescue boat".
+
+---
+AI_IMAGE_PROMPT:
+Write a SHORT (max 18 words) Pollinations AI image generation prompt.
+Must be: photorealistic, cinematic, dramatic lighting, no text, no real faces.
+Example: "rocket launching at night fire smoke dramatic sky photorealistic 4k"
+
+---
+{caption_instruction}
+
+Respond in EXACTLY this format — nothing else before or after:
+PHOTO_KEYWORD: <keyword here>
+AI_IMAGE_PROMPT: <prompt here>
+CAPTION:
+<full caption here>"""
+
+    result = call_gemini(prompt)
+    if not result:
+        return None, None, None
+
+    try:
+        keyword, ai_prompt, caption = None, None, None
+        lines = result.split("\n")
+        caption_lines = []
+        in_caption = False
+        for line in lines:
+            if line.startswith("PHOTO_KEYWORD:"):
+                keyword = line.split(":", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("AI_IMAGE_PROMPT:"):
+                ai_prompt = line.split(":", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("CAPTION:"):
+                in_caption = True
+            elif in_caption:
+                caption_lines.append(line)
+        caption = "\n".join(caption_lines).strip()
+        return keyword or "breaking news press", ai_prompt or "dramatic news event cinematic", caption or ""
+    except Exception as e:
+        print(f"Parse failed: {e}")
+        return "breaking news press", "dramatic news cinematic", ""
+
+
+# ── Pick best articles (single Gemini call) ───────────────────────────────────
 def fetch_articles(count=5):
-    print(f"Fetching articles for {count} posts...")
+    print(f"Fetching articles...")
     all_articles = []
-    selected_topics = random.sample(TRENDING_TOPICS, min(8, len(TRENDING_TOPICS)))
+    selected_topics = random.sample(TRENDING_TOPICS, min(7, len(TRENDING_TOPICS)))
     for topic in selected_topics:
-        url = "https://gnews.io/api/v4/search"
         params = {
-            "token": GNEWS_API_KEY,
-            "lang": "en",
-            "country": "in",
-            "max": 5,
-            "q": topic,
-            "sortby": "publishedAt"
+            "token": GNEWS_API_KEY, "lang": "en", "country": "in",
+            "max": 4, "q": topic, "sortby": "publishedAt"
         }
         try:
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            articles = data.get("articles", [])
-            for a in articles:
+            r = requests.get("https://gnews.io/api/v4/search", params=params, timeout=10)
+            arts = r.json().get("articles", [])
+            for a in arts:
                 a["_topic"] = topic
-            all_articles.extend(articles)
+            all_articles.extend(arts)
         except Exception as e:
-            print(f"Error fetching '{topic}': {e}")
+            print(f"Fetch '{topic}' error: {e}")
 
     if not all_articles:
-        print("Falling back to top headlines...")
-        url = "https://gnews.io/api/v4/top-headlines"
-        params = {"token": GNEWS_API_KEY, "lang": "en", "country": "in", "max": 10}
         try:
-            response = requests.get(url, params=params, timeout=10)
-            all_articles = response.json().get("articles", [])
+            r = requests.get("https://gnews.io/api/v4/top-headlines",
+                             params={"token": GNEWS_API_KEY, "lang": "en",
+                                     "country": "in", "max": 10}, timeout=10)
+            all_articles = r.json().get("articles", [])
         except Exception as e:
-            print(f"Fallback failed: {e}")
+            print(f"Headline fallback error: {e}")
 
     if not all_articles:
         return []
 
-    seen = set()
-    unique = []
+    seen, unique = set(), []
     for a in all_articles:
         if a["title"] not in seen:
             seen.add(a["title"])
             unique.append(a)
+    print(f"Found {len(unique)} unique articles")
 
-    print(f"Total unique articles: {len(unique)}")
-    return pick_top_articles(unique, count)
-
-# ── Gemini picks most controversial/engaging articles ─────────────────────────
-def pick_top_articles(articles, count=5):
-    print(f"Asking Gemini to pick top {count} high-engagement articles...")
-    titles = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(articles[:25])])
-    prompt = f"""You are a viral social media editor for an Indian news Instagram page targeting 18-35 year olds.
-
-Here are news article titles:
-{titles}
-
-Pick the TOP {count} articles that will generate the MOST engagement — likes, comments, shares, arguments, reactions.
-
-Prioritise articles about:
-- Controversies and scandals (government, celebrities, corporate)
-- Shocking crimes, injustice, corruption exposed
-- Things that make people ANGRY or EMOTIONAL
-- Major decisions that affect common Indians (prices, jobs, taxes, laws)
-- India vs Pakistan, cricket matches, major sports results
-- Viral moments people are already talking about
-- ISRO, major tech or science breakthroughs
-- Natural disasters, major accidents
-
-AVOID:
-- Celebrity meetups, photo ops, PR fluff (like "X meets Y at event")
-- Minor local municipal news
-- Repetitive political speeches without substance
-- Old recycled stories
-
-Reply with ONLY the numbers separated by commas. Example: 3,7,1,12,5
-Nothing else."""
-
+    # Pick best via ONE Gemini call
+    titles = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(unique[:25])])
+    prompt = (f"You are a viral Indian Instagram news editor.\n"
+              f"Pick TOP {count} articles for max engagement from young Indians.\n"
+              f"Prioritise: scandals, Supreme Court, cricket, ISRO, crime, protest, viral.\n"
+              f"Avoid: celebrity meetups, PR fluff, dry government reports.\n\n"
+              f"{titles}\n\n"
+              f"Reply with ONLY comma-separated numbers. Example: 3,7,1,12,5")
     answer = call_gemini(prompt)
     if answer:
         try:
-            numbers = [int(n.strip()) for n in answer.split(",") if n.strip().isdigit()]
-            numbers = [n for n in numbers if 1 <= n <= len(articles)][:count]
-            if len(numbers) >= 1:
-                print(f"Gemini picked: {numbers}")
-                return [articles[n-1] for n in numbers]
+            nums = [int(n.strip()) for n in answer.split(",") if n.strip().isdigit()]
+            nums = [n for n in nums if 1 <= n <= len(unique)][:count]
+            if nums:
+                print(f"Picked articles: {nums}")
+                return [unique[n-1] for n in nums]
         except Exception as e:
-            print(f"Gemini parse failed: {e}")
-    print("Using fallback articles")
-    return articles[:count]
+            print(f"Pick parse error: {e}")
+    return unique[:count]
 
-# ── Get photo search keyword ───────────────────────────────────────────────────
-def get_image_keyword(article):
-    prompt = f"""News headline: "{article['title']}"
-News description: "{article.get('description', '')[:200]}"
 
-Give ONE highly specific photo search keyword (3-5 words) for a stock photo that matches this news VISUALLY.
-
-CRITICAL RULES:
-- Match the actual visual scene, not the abstract topic
-- Good examples:
-  * "India inflation food prices" → "indian market vegetable stall"
-  * "Supreme Court verdict" → "supreme court building pillars"
-  * "IPL cricket match" → "cricket bat stadium night lights"
-  * "India Pakistan border" → "military soldiers border patrol"
-  * "ISRO rocket launch" → "rocket launch fire exhaust"
-  * "Farmer protest Delhi" → "protest crowd demonstration street"
-  * "Bollywood actress controversy" → "film set camera crew lights"
-  * "India flood disaster" → "flood water submerged village"
-  * "Startup funding" → "startup office whiteboard meeting"
-  * "Parliament session" → "parliament building dome architecture"
-- NEVER return: india flag, indian flag, india map, indian people generic, crowd generic
-- Be specific to the exact event in the headline
-
-Return ONLY the 3-5 word keyword. Nothing else."""
-
-    keyword = call_gemini(prompt)
-    if keyword:
-        keyword = keyword.strip().strip('"').strip("'")
-        blocked = ["india flag", "indian flag", "india map", "indian crowd",
-                   "people of india", "indian people", "india news", "breaking news generic"]
-        if any(b in keyword.lower() for b in blocked):
-            return _topic_fallback(article)
-        print(f"Photo keyword: '{keyword}'")
-        return keyword
-    return _topic_fallback(article)
-
-# ── Get AI image generation prompt ────────────────────────────────────────────
-def get_ai_image_prompt(article):
-    prompt = f"""News headline: "{article['title']}"
-News description: "{article.get('description', '')[:200]}"
-
-Write a SHORT image generation prompt (max 20 words) for an AI to create a photorealistic, dramatic news-style image for this story.
-
-Rules:
-- Photorealistic, cinematic, dramatic lighting
-- No text, no words, no logos in the image
-- No real people's faces or identifiable politicians
-- Focus on the SCENE or SYMBOL of the story
-- Examples:
-  * Cricket news → "dramatic cricket stadium at night, floodlights, packed crowd, photorealistic"
-  * Court verdict → "grand supreme court building exterior, dramatic sky, cinematic lighting"
-  * Protest news → "large peaceful protest crowd, signs, golden hour lighting, aerial view"
-  * Flood disaster → "flooded village road, rescue boat, dramatic storm clouds, photorealistic"
-  * Economic news → "indian market stalls, colorful vegetables, busy street, golden hour"
-  * Space/ISRO → "rocket launching at night, fire and smoke, dramatic sky, photorealistic"
-  * Political news → "empty parliament building interior, dramatic lighting, wide angle"
-
-Return ONLY the image prompt. Nothing else."""
-
-    ai_prompt = call_gemini(prompt)
-    if ai_prompt:
-        ai_prompt = ai_prompt.strip().strip('"').strip("'")
-        print(f"AI image prompt: '{ai_prompt}'")
-        return ai_prompt
-    # Fallback prompt
-    return _ai_prompt_fallback(article)
-
-def _ai_prompt_fallback(article):
-    title = article["title"].lower()
-    if "cricket" in title or "ipl" in title: return "cricket stadium night floodlights crowd dramatic cinematic"
-    if "court" in title or "verdict" in title: return "grand courthouse building dramatic sky cinematic"
-    if "protest" in title: return "peaceful protest crowd city street aerial view golden hour"
-    if "flood" in title: return "flooded village rescue boat storm clouds dramatic photorealistic"
-    if "rocket" in title or "isro" in title: return "rocket launch night fire smoke dramatic sky"
-    if "war" in title or "military" in title: return "military equipment dramatic sky cinematic wide angle"
-    if "economy" in title or "inflation" in title: return "busy indian market colorful stalls golden hour photorealistic"
-    if "bollywood" in title: return "film set camera lights dramatic cinema atmosphere"
-    return "dramatic news studio broadcast lights cinematic dark background"
-
-def _topic_fallback(article):
-    title = article["title"].lower()
-    if "cricket" in title or "ipl" in title: return "cricket stadium match crowd"
-    if "football" in title or "fifa" in title: return "football stadium match crowd"
-    if "bollywood" in title or "actor" in title: return "cinema stage lights performance"
-    if "court" in title or "verdict" in title: return "court justice law building"
-    if "protest" in title or "strike" in title: return "protest crowd demonstration street"
-    if "flood" in title or "disaster" in title: return "flood disaster rescue emergency"
-    if "rocket" in title or "isro" in title: return "rocket launch space fire"
-    if "scam" in title or "fraud" in title: return "handcuffs police investigation"
-    if "war" in title or "military" in title: return "military soldiers equipment"
-    if "economy" in title or "inflation" in title: return "stock market economy finance"
-    return "news press conference microphone"
-
-# ── Generate AI image via Pollinations (free, no key needed) ─────────────────
-def generate_ai_image(article, save_path):
-    """Generate a photorealistic AI image using Pollinations.AI — completely free."""
-    ai_prompt = get_ai_image_prompt(article)
-    # Add quality boosters
-    full_prompt = f"{ai_prompt}, high quality, 4k, photorealistic, professional photography, no text, no watermark"
-    encoded = quote(full_prompt)
-    # Pollinations.AI — free, no key, copyright-free outputs
-    # Using seed for variety, 1080x1080 square format
-    seed = random.randint(1, 99999)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1080&seed={seed}&model=flux&nologo=true"
-    print(f"Generating AI image from Pollinations...")
-    try:
-        r = requests.get(url, timeout=60, stream=True)
-        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-            with open(save_path, "wb") as f:
-                for chunk in r.iter_content(1024):
-                    f.write(chunk)
-            # Verify it's a valid image
-            img = Image.open(save_path)
-            img.verify()
-            print(f"✅ AI image generated successfully ({img.format if hasattr(img, 'format') else 'OK'})")
-            return save_path
-        else:
-            print(f"Pollinations failed: status {r.status_code}")
-            return None
-    except Exception as e:
-        print(f"AI image generation error: {e}")
-        return None
-
-# ── Fetch best image from multiple sources then AI fallback ──────────────────
-def fetch_image(article, save_path="/tmp/news_image.jpg"):
-    """
-    Priority order:
-    1. Unsplash (real photos, high quality)
-    2. Pexels   (real photos, very high quality)
-    3. Pixabay  (real photos, good variety)
-    4. Pollinations AI (generated, topic-specific, copyright-free)
-    """
-    keyword = get_image_keyword(article)
+# ── Image: try 3 real sources then AI fallback ────────────────────────────────
+def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     candidates = []
 
-    # ── Source 1: Unsplash ────────────────────────────────────────────────────
+    # Unsplash
     try:
-        url = "https://api.unsplash.com/search/photos"
-        params = {
-            "query": keyword, "per_page": 15,
-            "page": random.randint(1, 3),
-            "orientation": "squarish",
-            "client_id": UNSPLASH_ACCESS_KEY
-        }
-        r = requests.get(url, params=params, timeout=10)
+        params = {"query": keyword, "per_page": 15,
+                  "page": random.randint(1, 3), "orientation": "squarish",
+                  "client_id": UNSPLASH_ACCESS_KEY}
+        r = requests.get("https://api.unsplash.com/search/photos", params=params, timeout=10)
         results = r.json().get("results", [])
         if results:
-            photo = random.choice(results[:10])
-            candidates.append(("unsplash", photo["urls"]["regular"], photo.get("likes", 0)))
-            print(f"Unsplash: {len(results)} results for '{keyword}'")
-        else:
-            print(f"Unsplash: no results for '{keyword}'")
+            p = random.choice(results[:10])
+            candidates.append(("Unsplash", p["urls"]["regular"], p.get("likes", 0)))
+            print(f"Unsplash: {len(results)} results")
     except Exception as e:
         print(f"Unsplash error: {e}")
 
-    # ── Source 2: Pexels ──────────────────────────────────────────────────────
+    # Pexels
     if PEXELS_API_KEY:
         try:
-            url = "https://api.pexels.com/v1/search"
             params = {"query": keyword, "per_page": 15,
                       "page": random.randint(1, 3), "orientation": "square"}
-            r = requests.get(url, headers={"Authorization": PEXELS_API_KEY},
+            r = requests.get("https://api.pexels.com/v1/search",
+                             headers={"Authorization": PEXELS_API_KEY},
                              params=params, timeout=10)
             photos = r.json().get("photos", [])
             if photos:
-                photo = random.choice(photos[:10])
-                candidates.append(("pexels", photo["src"]["large2x"], 1000))
-                print(f"Pexels: {len(photos)} results for '{keyword}'")
-            else:
-                print(f"Pexels: no results for '{keyword}'")
+                p = random.choice(photos[:10])
+                candidates.append(("Pexels", p["src"]["large2x"], 1000))
+                print(f"Pexels: {len(photos)} results")
         except Exception as e:
             print(f"Pexels error: {e}")
 
-    # ── Source 3: Pixabay ─────────────────────────────────────────────────────
+    # Pixabay
     if PIXABAY_API_KEY:
         try:
-            url = "https://pixabay.com/api/"
-            params = {
-                "key": PIXABAY_API_KEY, "q": keyword,
-                "image_type": "photo", "per_page": 15,
-                "page": random.randint(1, 3),
-                "orientation": "horizontal", "safesearch": "true",
-                "min_width": 800
-            }
-            r = requests.get(url, params=params, timeout=10)
+            params = {"key": PIXABAY_API_KEY, "q": keyword, "image_type": "photo",
+                      "per_page": 15, "page": random.randint(1, 3),
+                      "orientation": "horizontal", "safesearch": "true", "min_width": 800}
+            r = requests.get("https://pixabay.com/api/", params=params, timeout=10)
             hits = r.json().get("hits", [])
             if hits:
-                photo = random.choice(hits[:10])
-                candidates.append(("pixabay", photo["webformatURL"], photo.get("likes", 0)))
-                print(f"Pixabay: {len(hits)} results for '{keyword}'")
-            else:
-                print(f"Pixabay: no results for '{keyword}'")
+                p = random.choice(hits[:10])
+                candidates.append(("Pixabay", p["webformatURL"], p.get("likes", 0)))
+                print(f"Pixabay: {len(hits)} results")
         except Exception as e:
             print(f"Pixabay error: {e}")
 
-    # ── Try to download a real photo ──────────────────────────────────────────
+    # Try downloading best real photo
     if candidates:
-        # Prefer Pexels for quality, otherwise pick highest likes
-        pexels = [c for c in candidates if c[0] == "pexels"]
-        chosen = pexels[0] if pexels else max(candidates, key=lambda x: x[2])
-        source_name, img_url, _ = chosen
+        pexels = [c for c in candidates if c[0] == "Pexels"]
+        src_name, img_url, _ = pexels[0] if pexels else max(candidates, key=lambda x: x[2])
         try:
-            print(f"Downloading from {source_name}...")
             r = requests.get(img_url, stream=True, timeout=20)
             if r.status_code == 200:
                 with open(save_path, "wb") as f:
                     for chunk in r.iter_content(4096):
                         f.write(chunk)
-                # Quick sanity check on the image
-                test_img = Image.open(save_path)
-                w, h = test_img.size
+                img = Image.open(save_path)
+                w, h = img.size
                 if w >= 400 and h >= 400:
-                    print(f"✅ Real photo from {source_name} ({w}x{h})")
-                    return save_path, source_name
-                else:
-                    print(f"Image too small ({w}x{h}), trying AI generation...")
+                    print(f"Real photo from {src_name} ({w}x{h})")
+                    return save_path, src_name
         except Exception as e:
-            print(f"Download failed: {e}")
+            print(f"Photo download error: {e}")
 
-    # ── Source 4: AI Generation (Pollinations) — always works ────────────────
-    print("No suitable real photo found — generating AI image...")
-    ai_path = save_path.replace(".jpg", "_ai.jpg")
-    result = generate_ai_image(article, ai_path)
-    if result:
-        return result, "AI Generated"
+    # AI fallback — Pollinations (free, no key)
+    print("Generating AI image via Pollinations...")
+    full_prompt = f"{ai_prompt}, high quality, 4k, photorealistic, no text, no watermark"
+    encoded = quote(full_prompt)
+    seed = random.randint(1, 99999)
+    ai_url = (f"https://image.pollinations.ai/prompt/{encoded}"
+              f"?width=1080&height=1080&seed={seed}&model=flux&nologo=true")
+    try:
+        r = requests.get(ai_url, timeout=90, stream=True)
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            ai_path = save_path.replace(".jpg", "_ai.jpg")
+            with open(ai_path, "wb") as f:
+                for chunk in r.iter_content(4096):
+                    f.write(chunk)
+            Image.open(ai_path).verify()
+            print("AI image generated OK")
+            return ai_path, "AI Generated"
+    except Exception as e:
+        print(f"AI image error: {e}")
 
-    print("All image sources failed — using plain background")
     return None, "none"
 
-# ── Design single post image ───────────────────────────────────────────────────
+
+# ── Image design helpers ──────────────────────────────────────────────────────
+def _load_fonts():
+    base = "/usr/share/fonts/truetype/dejavu/"
+    try:
+        return {
+            "huge":   ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 88),
+            "large":  ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 54),
+            "head":   ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 54),
+            "brand":  ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 36),
+            "source": ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 26),
+            "body":   ImageFont.truetype(base + "DejaVuSans.ttf", 30),
+            "small":  ImageFont.truetype(base + "DejaVuSans.ttf", 28),
+            "badge":  ImageFont.truetype(base + "DejaVuSans.ttf", 22),
+            "num":    ImageFont.truetype(base + "DejaVuSans-Bold.ttf", 105),
+        }
+    except:
+        d = ImageFont.load_default()
+        return {k: d for k in ["huge","large","head","brand","source","body","small","badge","num"]}
+
+
 def create_single_image(image_path, image_source, headline, source_name,
                         output_path="/tmp/final_post.jpg"):
-    img_size = (1080, 1080)
-    if image_path:
-        img = Image.open(image_path).convert("RGB").resize(img_size, Image.LANCZOS)
-    else:
-        img = Image.new("RGB", img_size, color=(20, 20, 40))
-
-    overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    for i in range(20):
-        alpha = int(175 + i * 3)
-        od.rectangle([(0, 530 + i*28), (1080, 530 + (i+1)*28)],
-                     fill=(0, 0, 0, min(alpha, 235)))
-    od.rectangle([(0, 0), (1080, 98)], fill=(0, 0, 0, 185))
-    od.rectangle([(0, 530), (9, 1080)], fill=(220, 30, 30, 255))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    sz = (1080, 1080)
+    img = (Image.open(image_path).convert("RGB").resize(sz, Image.LANCZOS)
+           if image_path else Image.new("RGB", sz, (20, 20, 40)))
+    ov = Image.new("RGBA", sz, (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    for i in range(22):
+        od.rectangle([(0, 520 + i*26), (1080, 520 + (i+1)*26)],
+                     fill=(0, 0, 0, min(170 + i*4, 235)))
+    od.rectangle([(0, 0), (1080, 98)],  fill=(0, 0, 0, 185))
+    od.rectangle([(0, 520), (9, 1080)], fill=(220, 30, 30, 255))
+    img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
     draw = ImageDraw.Draw(img)
+    f = _load_fonts()
 
-    try:
-        font_headline = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 54)
-        font_small    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
-        font_brand    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-        font_source   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
-        font_ai_badge = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-    except:
-        font_headline = font_small = font_brand = font_source = font_ai_badge = ImageFont.load_default()
-
-    draw.text((28, 26), "⚡ DAILY NEWS FLASH", font=font_brand, fill=(255, 200, 50))
-    draw.text((920, 26), "IN", font=font_brand, fill=(220, 30, 30))
-
-    # AI badge if image was generated
+    draw.text((28, 26), "⚡ DAILY NEWS FLASH", font=f["brand"], fill=(255, 200, 50))
+    draw.text((920, 26), "IN", font=f["brand"], fill=(220, 30, 30))
     if image_source == "AI Generated":
-        draw.rectangle([(28, 530), (195, 558)], fill=(80, 0, 150))
-        draw.text((35, 533), "✨ AI ILLUSTRATED", font=font_ai_badge, fill=(220, 180, 255))
-
-    draw.text((25, 570), f"📌 {source_name.upper()}", font=font_source, fill=(100, 190, 255))
-
-    wrapped = textwrap.wrap(headline, width=27)[:4]
-    for i, line in enumerate(wrapped):
-        draw.text((22, 625 + i * 68), line, font=font_headline, fill=(255, 255, 255))
-
+        draw.rectangle([(28, 522), (200, 548)], fill=(80, 0, 150))
+        draw.text((34, 525), "✨ AI ILLUSTRATED", font=f["badge"], fill=(220, 180, 255))
+    draw.text((25, 565), f"📌 {source_name.upper()}", font=f["source"], fill=(100, 190, 255))
+    y = 620
+    for line in textwrap.wrap(headline, width=27)[:4]:
+        draw.text((22, y), line, font=f["head"], fill=(255, 255, 255))
+        y += 68
     draw.rectangle([(0, 1022), (1080, 1080)], fill=(12, 12, 12))
     draw.text((22, 1036), "👉 Follow @dailynewsflash_in for daily updates",
-              font=font_small, fill=(190, 190, 190))
-
+              font=f["small"], fill=(190, 190, 190))
     img.save(output_path, "JPEG", quality=95)
     print("Single image created.")
     return output_path
 
-# ── Carousel cover slide ──────────────────────────────────────────────────────
+
 def create_cover_slide(output_path="/tmp/slide_0.jpg"):
-    img = Image.new("RGB", (1080, 1080), color=(8, 8, 25))
+    img = Image.new("RGB", (1080, 1080), (8, 8, 25))
     draw = ImageDraw.Draw(img)
-
-    try:
-        font_huge  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 88)
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 54)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-    except:
-        font_huge = font_large = font_small = ImageFont.load_default()
-
+    f = _load_fonts()
     for i in range(30):
-        draw.rectangle([(0, i*36), (1080, (i+1)*36)],
-                       fill=(10+i*2, 8+i, 30+i*3))
+        draw.rectangle([(0, i*36), (1080, (i+1)*36)], fill=(10+i*2, 8+i, 30+i*3))
     draw.rectangle([(55, 195), (1025, 207)], fill=(220, 30, 30))
     draw.rectangle([(55, 830), (1025, 842)], fill=(220, 30, 30))
-    draw.text((540, 135), "⚡ @dailynewsflash_in", font=font_small, fill=(255, 200, 50), anchor="mm")
-    draw.text((540, 390), "TODAY'S", font=font_huge, fill=(255, 255, 255), anchor="mm")
-    draw.text((540, 490), "TOP 5 NEWS", font=font_huge, fill=(220, 30, 30), anchor="mm")
-    today = datetime.now().strftime("%d %B %Y")
-    draw.text((540, 640), today, font=font_large, fill=(195, 195, 195), anchor="mm")
-    draw.text((540, 895), "👉 Swipe to read all 5 stories", font=font_small,
-              fill=(150, 150, 220), anchor="mm")
-    draw.text((540, 955), "Follow for India & World news daily", font=font_small,
-              fill=(110, 110, 180), anchor="mm")
-
+    draw.text((540, 135), "⚡ @dailynewsflash_in", font=f["small"],  fill=(255, 200, 50), anchor="mm")
+    draw.text((540, 390), "TODAY'S",    font=f["huge"],  fill=(255, 255, 255), anchor="mm")
+    draw.text((540, 490), "TOP 5 NEWS", font=f["huge"],  fill=(220, 30, 30),   anchor="mm")
+    draw.text((540, 640), datetime.now().strftime("%d %B %Y"),
+              font=f["large"], fill=(195, 195, 195), anchor="mm")
+    draw.text((540, 895), "👉 Swipe to read all 5 stories",
+              font=f["small"], fill=(150, 150, 220), anchor="mm")
+    draw.text((540, 955), "Follow for India & World news daily",
+              font=f["small"], fill=(110, 110, 180), anchor="mm")
     img.save(output_path, "JPEG", quality=95)
     return output_path
 
-# ── Carousel news slide ───────────────────────────────────────────────────────
+
 def create_news_slide(image_path, image_source, number, headline,
                       description, source, output_path):
-    img_size = (1080, 1080)
-    if image_path:
-        img = Image.open(image_path).convert("RGB").resize(img_size, Image.LANCZOS)
-    else:
-        img = Image.new("RGB", img_size, color=(12, 12, 35))
-
-    overlay = Image.new("RGBA", img_size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    od.rectangle([(0, 0), (1080, 1080)], fill=(0, 0, 0, 148))
-    od.rectangle([(0, 0), (1080, 98)],   fill=(0, 0, 0, 215))
+    sz = (1080, 1080)
+    img = (Image.open(image_path).convert("RGB").resize(sz, Image.LANCZOS)
+           if image_path else Image.new("RGB", sz, (12, 12, 35)))
+    ov = Image.new("RGBA", sz, (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    od.rectangle([(0,   0), (1080, 1080)], fill=(0, 0, 0, 148))
+    od.rectangle([(0,   0), (1080,   98)], fill=(0, 0, 0, 215))
     od.rectangle([(0, 885), (1080, 1080)], fill=(0, 0, 0, 230))
-    od.rectangle([(0, 0), (9, 1080)], fill=(220, 30, 30, 255))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    od.rectangle([(0,   0), (9,   1080)],  fill=(220, 30, 30, 255))
+    img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
     draw = ImageDraw.Draw(img)
+    f = _load_fonts()
 
-    try:
-        font_num   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 105)
-        font_head  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
-        font_desc  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
-        font_brand = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
-        font_badge = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-    except:
-        font_num = font_head = font_desc = font_small = font_brand = font_badge = ImageFont.load_default()
-
-    draw.text((28, 28), "⚡ DAILY NEWS FLASH", font=font_brand, fill=(255, 200, 50))
-    draw.text((860, 155), f"#{number}", font=font_num, fill=(220, 30, 30))
-
-    # AI badge
+    draw.text((28, 28), "⚡ DAILY NEWS FLASH", font=f["brand"], fill=(255, 200, 50))
+    draw.text((860, 155), f"#{number}", font=f["num"], fill=(220, 30, 30))
     if image_source == "AI Generated":
-        draw.rectangle([(28, 95), (195, 120)], fill=(80, 0, 150))
-        draw.text((34, 98), "✨ AI ILLUSTRATED", font=font_badge, fill=(220, 180, 255))
-
-    wrapped_head = textwrap.wrap(headline, width=25)
+        draw.rectangle([(28, 95), (200, 120)], fill=(80, 0, 150))
+        draw.text((34, 98), "✨ AI ILLUSTRATED", font=f["badge"], fill=(220, 180, 255))
     y = 290
-    for line in wrapped_head[:4]:
-        draw.text((28, y), line, font=font_head, fill=(255, 255, 255))
+    for line in textwrap.wrap(headline, width=25)[:4]:
+        draw.text((28, y), line, font=f["head"], fill=(255, 255, 255))
         y += 64
-
     if description:
         short = description[:220] + "..." if len(description) > 220 else description
         y += 18
         for line in textwrap.wrap(short, width=44)[:4]:
-            draw.text((28, y), line, font=font_desc, fill=(215, 215, 215))
+            draw.text((28, y), line, font=f["body"], fill=(215, 215, 215))
             y += 40
-
-    draw.text((28, 900),  f"📌 {source}", font=font_small, fill=(100, 190, 255))
-    draw.text((28, 945),  "Swipe for more →", font=font_small, fill=(155, 155, 210))
-    draw.text((28, 993),  "👉 Follow @dailynewsflash_in", font=font_small, fill=(255, 200, 50))
-
+    draw.text((28, 900),  f"📌 {source}",           font=f["small"], fill=(100, 190, 255))
+    draw.text((28, 945),  "Swipe for more →",         font=f["small"], fill=(155, 155, 210))
+    draw.text((28, 993),  "👉 Follow @dailynewsflash_in", font=f["small"], fill=(255, 200, 50))
     img.save(output_path, "JPEG", quality=95)
     return output_path
 
-# ── Single post caption ───────────────────────────────────────────────────────
-def generate_single_caption(article):
-    print("Generating caption...")
-    prompt = f"""You are a viral Instagram news editor for @dailynewsflash_in targeting Indians aged 18-35.
-
-Write a highly engaging, controversial, emotionally charged caption for:
-Title: {article['title']}
-Description: {article.get('description', '')}
-Source: {article['source']['name']}
-
-Caption structure:
-1. ONE punchy hook line with the most shocking/controversial angle — use 🔴 or 🚨 or ⚡
-
-2. 📖 WHAT HAPPENED — 3 to 4 clear sentences explaining the story in simple language:
-   - What exactly happened?
-   - Who is involved (people, organisations, government)?
-   - When and where did this happen?
-   - What has been the immediate reaction or consequence?
-   Write this like you are explaining to a friend who just woke up and knows nothing about it.
-
-3. 🤔 WHY IT MATTERS — 2 sentences on why every Indian should care about this.
-
-4. 🔥 THE CONTROVERSY — 1-2 sentences on what people are arguing about. Who is right? Who is wrong?
-
-5. One sentence hot take using Indian slang: "Yaar", "bhai", "sach mein", "desh ke log"
-
-6. 📌 Source: {article['source']['name']}
-
-7. 💬 What's YOUR take? Drop your opinion below 👇
-   Don't hold back — tell us what you really think!
-
-8. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
-
-9. 25 relevant hashtags (mix of English and Hindi hashtags like #India #BreakingNews #ISRO etc.)
-
-Rules: Facts only, no made-up details. Conversational tone. Emojis throughout. 1800-2200 chars total."""
-
-    caption = call_gemini(prompt)
-    if caption:
-        return caption
-    return f"⚡ {article['title']}\n\n📌 Source: {article['source']['name']}\n\n💬 What do you think? Comment!\n👉 Follow @dailynewsflash_in!\n\n#news #india #breakingnews"
-
-# ── Carousel caption ──────────────────────────────────────────────────────────
-def generate_carousel_caption(articles):
-    print("Generating carousel caption...")
-    headlines = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(articles)])
-    prompt = f"""You are a viral Instagram editor for @dailynewsflash_in for Indian 18-35 year olds.
-
-Write a carousel caption for today's top 5 controversial news stories:
-{headlines}
-
-Structure:
-1. 🗞️ Hook: "5 stories India is ARGUING about right now 👇 Swipe before it's too late!"
-2. One spicy one-liner per story (make it controversial/opinionated):
-   1️⃣ [story 1 — shocking angle]
-   2️⃣ [story 2 — shocking angle]
-   3️⃣ [story 3 — shocking angle]
-   4️⃣ [story 4 — shocking angle]
-   5️⃣ [story 5 — shocking angle]
-3. "Tell us which story made your blood boil 👇 Comment the number!"
-4. 💬 We want YOUR opinion — no filter!
-5. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
-6. 25 trending hashtags
-
-Under 2200 chars. Make it impossible NOT to swipe and comment."""
-
-    caption = call_gemini(prompt)
-    if caption:
-        return caption
-    return f"🗞️ Today's Top 5 Stories!\n\nSwipe 👉\n💬 Comment which shocked you!\n👉 Follow @dailynewsflash_in!\n\n#news #india #breakingnews"
 
 # ── Upload to Imgur ───────────────────────────────────────────────────────────
 def upload_to_imgur(image_path):
     with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
+        data = base64.b64encode(f.read()).decode("utf-8")
     try:
-        r = requests.post(
-            "https://api.imgur.com/3/image",
-            headers={"Authorization": "Client-ID 546c25a59c58ad7"},
-            data={"image": image_data, "type": "base64"},
-            timeout=30
-        )
-        data = r.json()
-        if data.get("success"):
-            print(f"Imgur: {data['data']['link']}")
-            return data["data"]["link"]
-        print(f"Imgur failed: {data}")
-        return None
+        r = requests.post("https://api.imgur.com/3/image",
+                          headers={"Authorization": "Client-ID 546c25a59c58ad7"},
+                          data={"image": data, "type": "base64"}, timeout=30)
+        d = r.json()
+        if d.get("success"):
+            print(f"Imgur OK: {d['data']['link']}")
+            return d["data"]["link"]
+        print(f"Imgur failed: {d}")
     except Exception as e:
         print(f"Imgur error: {e}")
-        return None
+    return None
 
-# ── Post single to Instagram ──────────────────────────────────────────────────
-def post_single(image_url, caption):
-    print("Posting to Instagram...")
+
+# ── Token auto-refresh ────────────────────────────────────────────────────────
+def refresh_fb_token():
+    """
+    Exchange the current token for a new 60-day long-lived token.
+    Requires FB_APP_ID and FB_APP_SECRET secrets in GitHub.
+    If those secrets are not set, skips silently.
+    """
+    app_id     = os.environ.get("FB_APP_ID", "")
+    app_secret = os.environ.get("FB_APP_SECRET", "")
+    if not app_id or not app_secret:
+        print("FB_APP_ID / FB_APP_SECRET not set — skipping token refresh")
+        return FB_ACCESS_TOKEN
+    try:
+        url = "https://graph.facebook.com/v25.0/oauth/access_token"
+        params = {
+            "grant_type":        "fb_exchange_token",
+            "client_id":         app_id,
+            "client_secret":     app_secret,
+            "fb_exchange_token": FB_ACCESS_TOKEN,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        d = r.json()
+        new_token = d.get("access_token", "")
+        if new_token:
+            print(f"Token refreshed OK (expires_in: {d.get('expires_in','?')}s)")
+            return new_token
+        print(f"Token refresh failed: {d}")
+    except Exception as e:
+        print(f"Token refresh error: {e}")
+    return FB_ACCESS_TOKEN
+
+
+# ── Post to Instagram ─────────────────────────────────────────────────────────
+def post_single(image_url, caption, token):
+    print("Posting single...")
     r = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
-        data={"image_url": image_url, "caption": caption, "access_token": FB_ACCESS_TOKEN},
-        timeout=30
-    )
-    result = r.json()
-    creation_id = result.get("id")
-    if not creation_id:
-        raise Exception(f"Container failed: {result}")
+        data={"image_url": image_url, "caption": caption, "access_token": token},
+        timeout=30)
+    cid = r.json().get("id")
+    if not cid:
+        raise Exception(f"Container failed: {r.json()}")
     time.sleep(8)
     r2 = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish",
-        data={"creation_id": creation_id, "access_token": FB_ACCESS_TOKEN},
-        timeout=30
-    )
+        data={"creation_id": cid, "access_token": token}, timeout=30)
     if "id" in r2.json():
-        print(f"✅ Posted! ID: {r2.json()['id']}")
+        print(f"✅ Single post live! ID: {r2.json()['id']}")
     else:
         raise Exception(f"Publish failed: {r2.json()}")
 
-# ── Post carousel to Instagram ────────────────────────────────────────────────
-def post_carousel(image_urls, caption):
-    print(f"Posting carousel with {len(image_urls)} slides...")
+
+def post_carousel(image_urls, caption, token):
+    print(f"Posting carousel ({len(image_urls)} slides)...")
     child_ids = []
-    for i, img_url in enumerate(image_urls):
+    for i, url in enumerate(image_urls):
         r = requests.post(
             f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
-            data={"image_url": img_url, "is_carousel_item": "true",
-                  "access_token": FB_ACCESS_TOKEN},
-            timeout=30
-        )
-        child_id = r.json().get("id")
-        if child_id:
-            child_ids.append(child_id)
+            data={"image_url": url, "is_carousel_item": "true", "access_token": token},
+            timeout=30)
+        cid = r.json().get("id")
+        if cid:
+            child_ids.append(cid)
         else:
-            print(f"  Slide {i+1} failed: {r.json()}")
+            print(f"Slide {i+1} failed: {r.json()}")
         time.sleep(3)
-
     if len(child_ids) < 2:
         raise Exception(f"Not enough slides ({len(child_ids)})")
-
     r = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
         data={"media_type": "CAROUSEL", "children": ",".join(child_ids),
-              "caption": caption, "access_token": FB_ACCESS_TOKEN},
-        timeout=30
-    )
-    carousel_id = r.json().get("id")
-    if not carousel_id:
+              "caption": caption, "access_token": token}, timeout=30)
+    carid = r.json().get("id")
+    if not carid:
         raise Exception(f"Carousel container failed: {r.json()}")
-
     time.sleep(8)
     r2 = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish",
-        data={"creation_id": carousel_id, "access_token": FB_ACCESS_TOKEN},
-        timeout=30
-    )
+        data={"creation_id": carid, "access_token": token}, timeout=30)
     if "id" in r2.json():
-        print(f"✅ Carousel posted! ID: {r2.json()['id']}")
+        print(f"✅ Carousel live! ID: {r2.json()['id']}")
     else:
         raise Exception(f"Carousel publish failed: {r2.json()}")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n=== Bot started {datetime.now()} | Type: {POST_TYPE} ===\n")
 
+    # Refresh FB token first (prevents the "session expired" error)
+    token = refresh_fb_token()
+
     if POST_TYPE == "carousel":
         articles = fetch_articles(count=5)
         if not articles:
-            print("No articles. Exiting.")
+            print("No articles found.")
             sys.exit(1)
 
         slide_paths = [create_cover_slide("/tmp/slide_0.jpg")]
+        carousel_captions = []
 
         for i, article in enumerate(articles):
-            print(f"\n--- Article {i+1}/5: {article['title'][:70]}...")
-            img_path, img_source = fetch_image(article, f"/tmp/slide_img_{i}.jpg")
-            slide_path = create_news_slide(
-                img_path, img_source, i+1,
-                article["title"],
-                article.get("description", ""),
-                article["source"]["name"],
-                f"/tmp/slide_{i+1}.jpg"
-            )
-            slide_paths.append(slide_path)
-            time.sleep(1)
+            print(f"\n--- Slide {i+1}/5: {article['title'][:65]}...")
+            # ONE Gemini call covers keyword + AI prompt + slide caption
+            keyword, ai_prompt, slide_cap = analyse_article(article, "carousel")
+            carousel_captions.append(slide_cap)
+            time.sleep(2)   # small pause between Gemini calls
 
-        print(f"\nUploading {len(slide_paths)} slides...")
-        image_urls = []
+            img_path, img_src = fetch_image(keyword, ai_prompt, article,
+                                             f"/tmp/slide_img_{i}.jpg")
+            slide = create_news_slide(img_path, img_src, i+1,
+                                      article["title"],
+                                      article.get("description", ""),
+                                      article["source"]["name"],
+                                      f"/tmp/slide_{i+1}.jpg")
+            slide_paths.append(slide)
+
+        # ONE more Gemini call for the main carousel caption
+        time.sleep(5)
+        headlines = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(articles)])
+        cap_prompt = (
+            f"Write an Instagram carousel caption for @dailynewsflash_in (young Indians 18-35).\n"
+            f"Stories:\n{headlines}\n\n"
+            f"Structure:\n"
+            f"1. 🗞️ Hook: '5 stories India is ARGUING about right now 👇'\n"
+            f"2. One spicy teaser per story (1️⃣ to 5️⃣)\n"
+            f"3. 'Tell us which story made your blood boil 👇 Comment the number!'\n"
+            f"4. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n"
+            f"5. 25 trending hashtags\nUnder 2200 chars."
+        )
+        main_caption = call_gemini(cap_prompt) or "🗞️ Today's Top 5!\n\n👉 Follow @dailynewsflash_in\n\n#news #india"
+
+        print("\nUploading slides...")
+        urls = []
         for path in slide_paths:
-            url = upload_to_imgur(path)
-            if url:
-                image_urls.append(url)
+            u = upload_to_imgur(path)
+            if u:
+                urls.append(u)
             time.sleep(2)
-
-        if len(image_urls) < 2:
-            print("Not enough uploads. Exiting.")
+        if len(urls) < 2:
+            print("Not enough uploads.")
             sys.exit(1)
-
-        caption = generate_carousel_caption(articles)
-        post_carousel(image_urls, caption)
+        post_carousel(urls, main_caption, token)
 
     else:
         articles = fetch_articles(count=1)
         if not articles:
-            print("No articles. Exiting.")
+            print("No articles found.")
             sys.exit(1)
         article = articles[0]
         print(f"\nArticle: {article['title']}")
-        image_path, image_source = fetch_image(article)
-        final_image = create_single_image(
-            image_path, image_source,
-            article["title"], article["source"]["name"]
-        )
-        image_url = upload_to_imgur(final_image)
-        if not image_url:
-            print("Upload failed. Exiting.")
+
+        # ONE Gemini call for everything
+        keyword, ai_prompt, caption = analyse_article(article, "single")
+        img_path, img_src = fetch_image(keyword, ai_prompt, article)
+        final = create_single_image(img_path, img_src, article["title"],
+                                    article["source"]["name"])
+        img_url = upload_to_imgur(final)
+        if not img_url:
+            print("Upload failed.")
             sys.exit(1)
-        caption = generate_single_caption(article)
-        post_single(image_url, caption)
+        post_single(img_url, caption, token)
 
     print(f"\n=== ✅ Done at {datetime.now()} ===\n")
+
 
 if __name__ == "__main__":
     main()
