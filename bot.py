@@ -123,7 +123,7 @@ Structure:
 Rules: facts only, conversational, emojis throughout, 1800-2200 chars, make people WANT to comment."""
 
     prompt = f"""You are an expert Indian news Instagram editor.
-Analyse this news article and return EXACTLY three sections labelled as shown.
+Analyse this news article and return EXACTLY four sections labelled as shown.
 
 Article title: {title}
 Description: {desc}
@@ -133,15 +133,35 @@ Topic category: {topic}
 ---
 PHOTO_KEYWORD:
 Give ONE specific 3-5 word stock photo search term that visually matches this story.
-NEVER use: india flag, indian flag, india map, indian crowd generic.
-Be literal: "cricket stadium night lights", "supreme court building pillars",
-"protest crowd city street", "rocket launch fire smoke", "flooded village rescue boat".
+Rules:
+- NEVER use: india flag, indian flag, india map, face, person, woman, man, portrait, girl, boy
+- Match the SCENE not the person: crime news → "police investigation crime scene tape",
+  court → "supreme court building exterior", cricket → "cricket stadium floodlights night",
+  protest → "protest crowd street demonstration", flood → "flood water submerged village",
+  space → "rocket launch fire smoke night sky", economy → "stock market trading screen",
+  bollywood → "film camera crew set lights", politics → "parliament building dome exterior"
+- NEVER generate images of people or faces under any circumstances
 
 ---
 AI_IMAGE_PROMPT:
 Write a SHORT (max 18 words) Pollinations AI image generation prompt.
-Must be: photorealistic, cinematic, dramatic lighting, no text, no real faces.
-Example: "rocket launching at night fire smoke dramatic sky photorealistic 4k"
+STRICT RULES — violations will ruin the post:
+- NO human faces, NO people, NO portraits, NO person, NO woman, NO man
+- Focus ONLY on: locations, objects, scenes, symbols, architecture, nature, vehicles
+- Must be: photorealistic, cinematic, dramatic lighting, no text, no logos
+- Crime/murder → "crime scene police tape dark alley dramatic lighting"
+- Court → "supreme court building stone pillars dramatic sky cinematic"
+- Cricket → "empty cricket stadium floodlights night dramatic wide angle"
+- Economy → "stock market graphs screens trading floor dramatic"
+- Space → "rocket on launchpad night dramatic sky cinematic"
+- Politics → "parliament building dome dramatic storm clouds cinematic"
+Good example: "dark crime scene investigation tape rain dramatic lighting photorealistic"
+BAD example: "woman looking at camera" — NEVER do this
+
+---
+SUMMARY:
+Write exactly 2 punchy sentences (max 40 words total) summarising what happened.
+Plain language. Facts only. No emojis. This appears ON the image card.
 
 ---
 {caption_instruction}
@@ -149,87 +169,171 @@ Example: "rocket launching at night fire smoke dramatic sky photorealistic 4k"
 Respond in EXACTLY this format — nothing else before or after:
 PHOTO_KEYWORD: <keyword here>
 AI_IMAGE_PROMPT: <prompt here>
+SUMMARY: <2 sentences here>
 CAPTION:
 <full caption here>"""
 
     result = call_gemini(prompt)
     if not result:
-        return None, None, None
+        return None, None, None, None
 
     try:
-        keyword, ai_prompt, caption = None, None, None
+        keyword, ai_prompt, summary, caption = None, None, None, None
         lines = result.split("\n")
         caption_lines = []
         in_caption = False
         for line in lines:
             if line.startswith("PHOTO_KEYWORD:"):
                 keyword = line.split(":", 1)[1].strip().strip('"').strip("'")
+                in_caption = False
             elif line.startswith("AI_IMAGE_PROMPT:"):
                 ai_prompt = line.split(":", 1)[1].strip().strip('"').strip("'")
+                in_caption = False
+            elif line.startswith("SUMMARY:"):
+                summary = line.split(":", 1)[1].strip()
+                in_caption = False
             elif line.startswith("CAPTION:"):
                 in_caption = True
             elif in_caption:
                 caption_lines.append(line)
         caption = "\n".join(caption_lines).strip()
-        return keyword or "breaking news press", ai_prompt or "dramatic news event cinematic", caption or ""
+        return (keyword or "breaking news press",
+                ai_prompt or "dark dramatic scene cinematic",
+                summary or "",
+                caption or "")
     except Exception as e:
         print(f"Parse failed: {e}")
-        return "breaking news press", "dramatic news cinematic", ""
+        return "breaking news press", "dark dramatic scene cinematic", "", ""
 
 
-# ── Pick best articles (single Gemini call) ───────────────────────────────────
-def fetch_articles(count=5):
-    print(f"Fetching articles...")
-    all_articles = []
-    selected_topics = random.sample(TRENDING_TOPICS, min(7, len(TRENDING_TOPICS)))
-    for topic in selected_topics:
-        params = {
-            "token": GNEWS_API_KEY, "lang": "en", "country": "in",
-            "max": 4, "q": topic, "sortby": "publishedAt"
-        }
-        try:
-            r = requests.get("https://gnews.io/api/v4/search", params=params, timeout=10)
-            arts = r.json().get("articles", [])
-            for a in arts:
-                a["_topic"] = topic
-            all_articles.extend(arts)
-        except Exception as e:
-            print(f"Fetch '{topic}' error: {e}")
+# ── Free RSS feeds — unlimited, no API key ────────────────────────────────────
+RSS_FEEDS = [
+    ("https://feeds.feedburner.com/ndtvnews-top-stories",         "NDTV"),
+    ("https://timesofindia.indiatimes.com/rssfeedstopstories.cms","Times of India"),
+    ("https://www.thehindu.com/news/feeder/default.rss",          "The Hindu"),
+    ("https://indianexpress.com/feed/",                           "Indian Express"),
+    ("https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml","Hindustan Times"),
+    ("https://feeds.bbci.co.uk/news/world/asia/india/rss.xml",    "BBC India"),
+]
 
-    if not all_articles:
-        try:
-            r = requests.get("https://gnews.io/api/v4/top-headlines",
-                             params={"token": GNEWS_API_KEY, "lang": "en",
-                                     "country": "in", "max": 10}, timeout=10)
-            all_articles = r.json().get("articles", [])
-        except Exception as e:
-            print(f"Headline fallback error: {e}")
-
-    if not all_articles:
+def _fetch_rss(url, source_name):
+    try:
+        r = requests.get(url, timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0 NewsBot/1.0"})
+        if r.status_code != 200:
+            return []
+        xml = r.text
+        articles = []
+        items = xml.split("<item>")[1:]
+        for item in items[:15]:
+            def tag(t, block=item):
+                s = block.find(f"<{t}>")
+                e = block.find(f"</{t}>")
+                if s == -1 or e == -1:
+                    return ""
+                return block[s+len(t)+2:e].strip().replace("<![CDATA[","").replace("]]>","").strip()
+            title = tag("title")
+            desc  = tag("description")[:300]
+            link  = tag("link")
+            if title and len(title) > 10:
+                articles.append({
+                    "title":       title,
+                    "description": desc,
+                    "url":         link,
+                    "source":      {"name": source_name},
+                    "_topic":      "general",
+                })
+        print(f"RSS {source_name}: {len(articles)} articles")
+        return articles
+    except Exception as e:
+        print(f"RSS {source_name} error: {e}")
         return []
 
+
+# ── fetch_articles: 2 GNews calls max + RSS backup ────────────────────────────
+def fetch_articles(count=5):
+    """
+    GNews free = 100 req/day. We use max 2 calls per run (10/day for 5 posts).
+    RSS feeds are free, unlimited, no key needed — always used as supplement.
+    """
+    print("Fetching articles...")
+    all_articles = []
+
+    # Call 1: GNews top headlines (1 request)
+    try:
+        r = requests.get(
+            "https://gnews.io/api/v4/top-headlines",
+            params={"token": GNEWS_API_KEY, "lang": "en",
+                    "country": "in", "max": 10},
+            timeout=10)
+        data = r.json()
+        arts = data.get("articles", [])
+        for a in arts:
+            a["_topic"] = "top-headlines"
+        all_articles.extend(arts)
+        print(f"GNews headlines: {len(arts)} articles")
+    except Exception as e:
+        print(f"GNews headlines error: {e}")
+
+    # Call 2: GNews search — ONE topic (1 request)
+    topic = random.choice([
+        "India controversy", "India crime", "cricket India",
+        "India politics", "India economy", "bollywood scandal",
+        "India Supreme Court", "India scam",
+    ])
+    try:
+        r = requests.get(
+            "https://gnews.io/api/v4/search",
+            params={"token": GNEWS_API_KEY, "lang": "en", "country": "in",
+                    "max": 10, "q": topic, "sortby": "publishedAt"},
+            timeout=10)
+        arts = r.json().get("articles", [])
+        for a in arts:
+            a["_topic"] = topic
+        all_articles.extend(arts)
+        print(f"GNews search '{topic}': {len(arts)} articles")
+    except Exception as e:
+        print(f"GNews search error: {e}")
+
+    # RSS supplement — always run, free, no quota
+    print("Loading RSS feeds...")
+    feeds = random.sample(RSS_FEEDS, min(3, len(RSS_FEEDS)))
+    for feed_url, feed_name in feeds:
+        all_articles.extend(_fetch_rss(feed_url, feed_name))
+
+    if not all_articles:
+        print("All sources failed — no articles available.")
+        return []
+
+    # Deduplicate
     seen, unique = set(), []
     for a in all_articles:
-        if a["title"] not in seen:
-            seen.add(a["title"])
+        t = a["title"].strip().lower()
+        if t not in seen and len(t) > 10:
+            seen.add(t)
             unique.append(a)
-    print(f"Found {len(unique)} unique articles")
+    print(f"Total unique articles: {len(unique)}")
 
-    # Pick best via ONE Gemini call
+    if len(unique) <= count:
+        return unique
+
+    # ONE Gemini call to pick best
     titles = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(unique[:25])])
-    prompt = (f"You are a viral Indian Instagram news editor.\n"
-              f"Pick TOP {count} articles for max engagement from young Indians.\n"
-              f"Prioritise: scandals, Supreme Court, cricket, ISRO, crime, protest, viral.\n"
-              f"Avoid: celebrity meetups, PR fluff, dry government reports.\n\n"
-              f"{titles}\n\n"
-              f"Reply with ONLY comma-separated numbers. Example: 3,7,1,12,5")
+    prompt = (
+        "You are a viral Indian Instagram news editor.\n"
+        f"Pick TOP {count} articles for max engagement from young Indians (18-35).\n"
+        "Prioritise: scandals, Supreme Court, cricket, ISRO, crime, protest, govt decisions.\n"
+        "Avoid: celebrity meetups, PR fluff, dry reports, repeated stories.\n\n"
+        f"{titles}\n\n"
+        "Reply with ONLY comma-separated numbers. Example: 3,7,1,12,5\nNothing else."
+    )
     answer = call_gemini(prompt)
     if answer:
         try:
             nums = [int(n.strip()) for n in answer.split(",") if n.strip().isdigit()]
             nums = [n for n in nums if 1 <= n <= len(unique)][:count]
-            if nums:
-                print(f"Picked articles: {nums}")
+            if len(nums) >= min(count, len(unique)):
+                print(f"Gemini picked: {nums}")
                 return [unique[n-1] for n in nums]
         except Exception as e:
             print(f"Pick parse error: {e}")
@@ -346,8 +450,34 @@ def _load_fonts():
         return {k: d for k in ["huge","large","head","brand","source","body","small","badge","num"]}
 
 
+def _get_topic_tag(headline, source):
+    """Return a short uppercase category label for the post."""
+    h = headline.lower()
+    if any(w in h for w in ["murder","crime","rape","arrest","theft","fraud","scam","stolen"]):
+        return "CRIME"
+    if any(w in h for w in ["cricket","ipl","match","wicket","run","batting","bowling","rohit","kohli","virat"]):
+        return "CRICKET"
+    if any(w in h for w in ["court","verdict","judge","sc","high court","cbi","ed","bail"]):
+        return "JUSTICE"
+    if any(w in h for w in ["bollywood","film","movie","actor","actress","cinema","ott"]):
+        return "BOLLYWOOD"
+    if any(w in h for w in ["isro","space","rocket","satellite","moon","mars","chandrayaan"]):
+        return "SPACE"
+    if any(w in h for w in ["inflation","gdp","economy","rupee","rbi","stock","market","budget"]):
+        return "ECONOMY"
+    if any(w in h for w in ["protest","strike","rally","agitation","farmer","worker"]):
+        return "PROTEST"
+    if any(w in h for w in ["pakistan","china","border","military","army","war","ceasefire"]):
+        return "WORLD"
+    if any(w in h for w in ["modi","bjp","congress","government","minister","parliament","election"]):
+        return "POLITICS"
+    if any(w in h for w in ["flood","earthquake","cyclone","disaster","rain","storm"]):
+        return "DISASTER"
+    return "INDIA"
+
+
 def create_single_image(image_path, image_source, headline, source_name,
-                        output_path="/tmp/final_post.jpg"):
+                        summary="", output_path="/tmp/final_post.jpg"):
     sz = (1080, 1080)
     img = (Image.open(image_path).convert("RGB").resize(sz, Image.LANCZOS)
            if image_path else Image.new("RGB", sz, (20, 20, 40)))
@@ -364,14 +494,35 @@ def create_single_image(image_path, image_source, headline, source_name,
 
     draw.text((28, 26), "⚡ DAILY NEWS FLASH", font=f["brand"], fill=(255, 200, 50))
     draw.text((920, 26), "IN", font=f["brand"], fill=(220, 30, 30))
+
+    # Topic tag (top-right area)
+    topic_tag = _get_topic_tag(headline, source_name)
+    tag_w = len(topic_tag) * 14 + 20
+    draw.rectangle([(1080-tag_w-10, 60), (1070, 88)], fill=(220, 30, 30))
+    draw.text((1080-tag_w, 63), topic_tag, font=f["badge"], fill=(255, 255, 255))
+
     if image_source == "AI Generated":
-        draw.rectangle([(28, 522), (200, 548)], fill=(80, 0, 150))
+        draw.rectangle([(28, 522), (210, 548)], fill=(80, 0, 150))
         draw.text((34, 525), "✨ AI ILLUSTRATED", font=f["badge"], fill=(220, 180, 255))
-    draw.text((25, 565), f"📌 {source_name.upper()}", font=f["source"], fill=(100, 190, 255))
-    y = 620
-    for line in textwrap.wrap(headline, width=27)[:4]:
+
+    # Source label
+    draw.text((25, 558), f"📌 {source_name.upper()}", font=f["source"], fill=(100, 190, 255))
+
+    # Headline
+    y = 608
+    for line in textwrap.wrap(headline, width=27)[:3]:
         draw.text((22, y), line, font=f["head"], fill=(255, 255, 255))
-        y += 68
+        y += 64
+
+    # Brief summary on card — the key fix
+    if summary:
+        y += 8
+        draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))  # thin red divider
+        y += 10
+        for line in textwrap.wrap(summary, width=42)[:3]:
+            draw.text((22, y), line, font=f["small"], fill=(210, 210, 210))
+            y += 36
+
     draw.rectangle([(0, 1022), (1080, 1080)], fill=(12, 12, 12))
     draw.text((22, 1036), "👉 Follow @dailynewsflash_in for daily updates",
               font=f["small"], fill=(190, 190, 190))
@@ -560,7 +711,7 @@ def main():
         for i, article in enumerate(articles):
             print(f"\n--- Slide {i+1}/5: {article['title'][:65]}...")
             # ONE Gemini call covers keyword + AI prompt + slide caption
-            keyword, ai_prompt, slide_cap = analyse_article(article, "carousel")
+            keyword, ai_prompt, summary, slide_cap = analyse_article(article, "carousel")
             carousel_captions.append(slide_cap)
             time.sleep(2)   # small pause between Gemini calls
 
@@ -609,10 +760,10 @@ def main():
         print(f"\nArticle: {article['title']}")
 
         # ONE Gemini call for everything
-        keyword, ai_prompt, caption = analyse_article(article, "single")
+        keyword, ai_prompt, summary, caption = analyse_article(article, "single")
         img_path, img_src = fetch_image(keyword, ai_prompt, article)
         final = create_single_image(img_path, img_src, article["title"],
-                                    article["source"]["name"])
+                                    article["source"]["name"], summary)
         img_url = upload_to_imgur(final)
         if not img_url:
             print("Upload failed.")
