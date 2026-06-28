@@ -608,34 +608,62 @@ def upload_to_imgur(image_path):
 
 
 # ── Token auto-refresh ────────────────────────────────────────────────────────
+def _get_page_token(user_token, app_id, app_secret):
+    """Exchange user token for a Page access token (never expires)."""
+    try:
+        # Step 1: Get long-lived user token (60 days)
+        r = requests.get(
+            "https://graph.facebook.com/v25.0/oauth/access_token",
+            params={"grant_type": "fb_exchange_token",
+                    "client_id": app_id, "client_secret": app_secret,
+                    "fb_exchange_token": user_token},
+            timeout=15)
+        d = r.json()
+        ll_token = d.get("access_token", "")
+        if not ll_token:
+            print(f"Long-lived token exchange failed: {d}")
+            return None
+        print(f"Long-lived token obtained (expires ~60 days)")
+
+        # Step 2: Get Page access token (never expires for verified apps)
+        r2 = requests.get(
+            f"https://graph.facebook.com/v25.0/{os.environ.get('FB_PAGE_ID','')}/",
+            params={"fields": "access_token", "access_token": ll_token},
+            timeout=15)
+        d2 = r2.json()
+        page_token = d2.get("access_token", "")
+        if page_token:
+            print("Page token obtained (never expires)")
+            return page_token
+        print(f"Page token failed: {d2}")
+        return ll_token   # fall back to 60-day token
+    except Exception as e:
+        print(f"Page token error: {e}")
+        return None
+
+
 def refresh_fb_token():
     """
-    Exchange the current token for a new 60-day long-lived token.
-    Requires FB_APP_ID and FB_APP_SECRET secrets in GitHub.
-    If those secrets are not set, skips silently.
+    Full token refresh chain:
+    1. If FB_APP_ID + FB_APP_SECRET present: get a never-expiring Page token
+    2. If only those missing: use existing FB_ACCESS_TOKEN as-is
+    Logs clearly so you know the status every run.
     """
-    app_id     = os.environ.get("FB_APP_ID", "")
-    app_secret = os.environ.get("FB_APP_SECRET", "")
+    app_id     = os.environ.get("FB_APP_ID", "").strip()
+    app_secret = os.environ.get("FB_APP_SECRET", "").strip()
+
     if not app_id or not app_secret:
-        print("FB_APP_ID / FB_APP_SECRET not set — skipping token refresh")
+        print("⚠️  FB_APP_ID / FB_APP_SECRET not set in GitHub Secrets.")
+        print("    Token will expire every few hours — see setup instructions.")
+        print(f"    Using current token (may be expired).")
         return FB_ACCESS_TOKEN
-    try:
-        url = "https://graph.facebook.com/v25.0/oauth/access_token"
-        params = {
-            "grant_type":        "fb_exchange_token",
-            "client_id":         app_id,
-            "client_secret":     app_secret,
-            "fb_exchange_token": FB_ACCESS_TOKEN,
-        }
-        r = requests.get(url, params=params, timeout=15)
-        d = r.json()
-        new_token = d.get("access_token", "")
-        if new_token:
-            print(f"Token refreshed OK (expires_in: {d.get('expires_in','?')}s)")
-            return new_token
-        print(f"Token refresh failed: {d}")
-    except Exception as e:
-        print(f"Token refresh error: {e}")
+
+    print("Refreshing FB token...")
+    new_token = _get_page_token(FB_ACCESS_TOKEN, app_id, app_secret)
+    if new_token:
+        return new_token
+
+    print("Token refresh failed — using existing token")
     return FB_ACCESS_TOKEN
 
 
