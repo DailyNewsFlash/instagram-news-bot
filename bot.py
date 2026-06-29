@@ -10,15 +10,15 @@ import sys
 from urllib.parse import quote
 
 # ── API keys ──────────────────────────────────────────────────────────────────
-GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"]
-UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
-GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"]
-FB_PAGE_ID          = os.environ["FB_PAGE_ID"]
-FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"]
-IG_ACCOUNT_ID       = os.environ["IG_ACCOUNT_ID"]
-PEXELS_API_KEY      = os.environ.get("PEXELS_API_KEY", "")
-PIXABAY_API_KEY     = os.environ.get("PIXABAY_API_KEY", "")
-POST_TYPE           = os.environ.get("POST_TYPE", "single")
+GNEWS_API_KEY       = os.environ["GNEWS_API_KEY"].strip()
+UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"].strip()
+GEMINI_API_KEY      = os.environ["GEMINI_API_KEY"].strip()
+FB_PAGE_ID          = os.environ["FB_PAGE_ID"].strip()
+FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"].strip()
+IG_ACCOUNT_ID       = os.environ["IG_ACCOUNT_ID"].strip()
+PEXELS_API_KEY      = os.environ.get("PEXELS_API_KEY", "").strip()
+PIXABAY_API_KEY     = os.environ.get("PIXABAY_API_KEY", "").strip()
+POST_TYPE           = os.environ.get("POST_TYPE", "single").strip()
 
 # ── Topics ────────────────────────────────────────────────────────────────────
 TRENDING_TOPICS = [
@@ -52,7 +52,7 @@ GEMINI_MODELS = [
 ]
 
 # Primary key always set. Secondary key optional — doubles capacity if set.
-_GEMINI_KEYS = [k for k in [
+_GEMINI_KEYS = [k.strip() for k in [
     os.environ.get("GEMINI_API_KEY", ""),
     os.environ.get("GEMINI_API_KEY_2", ""),   # optional second key
 ] if k.strip()]
@@ -88,12 +88,12 @@ def call_gemini(prompt, retries=2):
         for attempt in range(retries):
             key = _next_key()
 
-            # Enforce minimum gap per key to stay under rate limit
+            # Enforce minimum gap per key — 8s gives 7.5 req/min, safe under 15 limit
             now = time.time()
             last = _last_call.get(key, 0)
             gap = now - last
-            if gap < 6:
-                time.sleep(6 - gap)
+            if gap < 8:
+                time.sleep(8 - gap)
 
             try:
                 url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -114,8 +114,11 @@ def call_gemini(prompt, retries=2):
                 err_code = data.get("error", {}).get("code", 0)
 
                 if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
-                    # Rate limited — wait longer and retry (switch key on next attempt)
-                    wait = 20 + (attempt * 20)
+                    # Try to read retry-after from error message
+                    import re as _re
+                    retry_match = _re.search(r"retry.{0,10}?([0-9]+)\s*s", err_msg, _re.IGNORECASE)
+                    suggested = int(retry_match.group(1)) + 5 if retry_match else None
+                    wait = suggested if suggested else (25 + attempt * 15)
                     print(f"Rate limit ({model}), waiting {wait}s then retrying...")
                     time.sleep(wait)
                     continue
@@ -850,9 +853,18 @@ def post_single(image_url, caption, token):
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
         data={"image_url": image_url, "caption": caption, "access_token": token},
         timeout=30)
-    cid = r.json().get("id")
+    result = r.json()
+    cid = result.get("id")
     if not cid:
-        raise Exception(f"Container failed: {r.json()}")
+        err = result.get("error", {})
+        code = err.get("code", "?")
+        msg  = err.get("message", str(result))
+        # Token expired — give clear instructions
+        if code in [190, 463] or "expired" in msg.lower() or "session" in msg.lower():
+            print("❌ FB TOKEN EXPIRED. Fix: Go to developers.facebook.com/tools/explorer")
+            print("   → Generate Access Token → me/accounts → copy access_token")
+            print("   → Update FB_ACCESS_TOKEN secret in GitHub")
+        raise Exception(f"Container failed (code {code}): {msg}")
     time.sleep(8)
     r2 = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish",
