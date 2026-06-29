@@ -42,52 +42,182 @@ TRENDING_TOPICS = [
     "India education system",
 ]
 
-# ── Gemini: smart rate-limit handling with model fallbacks ────────────────────
-# Free tier limits: 15 req/min on 2.0-flash, 15 req/min on 1.5-flash
-# We add delays between calls to stay well under the limit
+# ── Gemini: dual-key rotation + model fallbacks ───────────────────────────────
+# Free tier: 15 req/min per key. Two keys = 30 req/min effective limit.
+# We rotate keys + models to avoid hitting any single limit.
 GEMINI_MODELS = [
     "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-1.5-flash-8b",
 ]
-_last_gemini_call = 0   # track time of last call globally
+
+# Primary key always set. Secondary key optional — doubles capacity if set.
+_GEMINI_KEYS = [k for k in [
+    os.environ.get("GEMINI_API_KEY", ""),
+    os.environ.get("GEMINI_API_KEY_2", ""),   # optional second key
+] if k.strip()]
+
+_key_index   = 0      # which key to use next
+_last_call   = {}     # per-key last call timestamp
+_call_count  = {}     # per-key call count this run
+
+def _next_key():
+    """Round-robin between available keys."""
+    global _key_index
+    if len(_GEMINI_KEYS) == 0:
+        return ""
+    key = _GEMINI_KEYS[_key_index % len(_GEMINI_KEYS)]
+    _key_index += 1
+    return key
 
 def call_gemini(prompt, retries=2):
-    global _last_gemini_call
-    # Always wait at least 5 seconds between Gemini calls to avoid rate limits
-    elapsed = time.time() - _last_gemini_call
-    if elapsed < 5:
-        time.sleep(5 - elapsed)
+    """
+    Call Gemini with:
+    - Key rotation (if 2 keys configured, alternates between them)
+    - Model fallback (2.0-flash → 1.5-flash → 1.5-flash-8b)
+    - Smart rate-limit backoff (waits then retries, doesn't just give up)
+    - Minimum 6s gap between calls to stay under 15 req/min
+    """
+    if not _GEMINI_KEYS:
+        print("No Gemini API key configured")
+        return None
 
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     for model in GEMINI_MODELS:
-        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{model}:generateContent?key={GEMINI_API_KEY}")
         for attempt in range(retries):
-            try:
-                _last_gemini_call = time.time()
-                resp = requests.post(url, json=payload, timeout=30)
-                data = resp.json()
-                if "candidates" in data:
-                    print(f"Gemini OK ({model})")
-                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                err_msg = data.get("error", {}).get("message", "")
-                err_code = data.get("error", {}).get("code", 0)
-                if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
-                    wait = 35 + (attempt * 30)
-                    print(f"Rate limit on {model}, waiting {wait}s...")
-                    time.sleep(wait)
-                    continue    # retry same model after wait
-                else:
-                    print(f"Gemini {model} error: {err_msg}")
-                    break       # non-rate error → try next model
-            except Exception as e:
-                print(f"Gemini {model} exception: {e}")
-                time.sleep(5)
+            key = _next_key()
 
-    print("All Gemini models failed — using rule-based fallback")
+            # Enforce minimum gap per key to stay under rate limit
+            now = time.time()
+            last = _last_call.get(key, 0)
+            gap = now - last
+            if gap < 6:
+                time.sleep(6 - gap)
+
+            try:
+                url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                       f"{model}:generateContent?key={key}")
+                _last_call[key] = time.time()
+                _call_count[key] = _call_count.get(key, 0) + 1
+
+                resp = requests.post(url, json=payload, timeout=35)
+                data = resp.json()
+
+                if "candidates" in data:
+                    keys_info = f"key{'1' if key == _GEMINI_KEYS[0] else '2'}"
+                    print(f"Gemini OK ({model}, {keys_info}, "
+                          f"call #{_call_count.get(key,1)} this run)")
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+                err_msg  = data.get("error", {}).get("message", "")
+                err_code = data.get("error", {}).get("code", 0)
+
+                if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
+                    # Rate limited — wait longer and retry (switch key on next attempt)
+                    wait = 20 + (attempt * 20)
+                    print(f"Rate limit ({model}), waiting {wait}s then retrying...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    print(f"Gemini error ({model}): {err_msg}")
+                    break  # non-rate error — try next model
+
+            except Exception as e:
+                print(f"Gemini exception ({model}): {e}")
+                time.sleep(4)
+
+    print("All Gemini options exhausted — using rule-based fallback")
     return None
+
+
+# ── Rule-based fallbacks (used when Gemini is rate-limited) ─────────────────
+def _rule_keyword(article):
+    t = article["title"].lower()
+    d = article.get("description", "").lower()
+    combined = t + " " + d
+    if any(w in combined for w in ["murder","kill","dead","body","crime","arrest","rape","attack"]):
+        return "crime scene police tape investigation dark"
+    if any(w in combined for w in ["cricket","ipl","match","wicket","bat","bowl","rohit","kohli","virat"]):
+        return "cricket stadium floodlights night match"
+    if any(w in combined for w in ["court","verdict","judge","bail","cbi","ed","fir","law"]):
+        return "supreme court building exterior stone pillars"
+    if any(w in combined for w in ["bollywood","film","movie","actor","actress","cinema","ott","star"]):
+        return "film camera crew set dramatic lights"
+    if any(w in combined for w in ["isro","rocket","satellite","space","moon","mars","chandrayaan"]):
+        return "rocket launch fire smoke night sky"
+    if any(w in combined for w in ["flood","earthquake","cyclone","disaster","rain","landslide"]):
+        return "flood disaster rescue boat water submerged"
+    if any(w in combined for w in ["protest","strike","rally","agitation","crowd","demonstration"]):
+        return "protest crowd street demonstration banners"
+    if any(w in combined for w in ["war","military","army","border","soldier","pakistan","china"]):
+        return "military soldiers equipment dramatic sky"
+    if any(w in combined for w in ["economy","inflation","rupee","market","stock","gdp","budget","rbi"]):
+        return "stock market trading screen finance"
+    if any(w in combined for w in ["scam","fraud","ponzi","crypto","hack","cheat","fake"]):
+        return "handcuffs police arrest investigation"
+    if any(w in combined for w in ["fire","blast","explosion","building"]):
+        return "fire explosion building dramatic night"
+    if any(w in combined for w in ["hospital","health","doctor","disease","medicine","drug"]):
+        return "hospital interior medical equipment"
+    if any(w in combined for w in ["school","college","university","student","education","exam"]):
+        return "university campus students studying"
+    if any(w in combined for w in ["modi","bjp","congress","parliament","minister","election","government"]):
+        return "parliament building dome architecture exterior"
+    return "india city skyline dramatic dusk"
+
+
+def _rule_ai_prompt(article):
+    t = article["title"].lower()
+    d = article.get("description", "").lower()
+    combined = t + " " + d
+    if any(w in combined for w in ["murder","kill","crime","arrest","rape","attack"]):
+        return "dark crime scene yellow police tape rain dramatic cinematic no people"
+    if any(w in combined for w in ["cricket","ipl","match"]):
+        return "empty cricket stadium at night floodlights dramatic wide angle cinematic"
+    if any(w in combined for w in ["court","verdict","judge","law"]):
+        return "grand supreme court building stone exterior dramatic storm clouds cinematic"
+    if any(w in combined for w in ["isro","rocket","space","satellite"]):
+        return "rocket on launchpad night dramatic fire smoke sky cinematic"
+    if any(w in combined for w in ["flood","disaster","cyclone"]):
+        return "flooded village road dramatic storm clouds rescue boat cinematic"
+    if any(w in combined for w in ["protest","strike","rally"]):
+        return "empty city street night dramatic lights fog cinematic wide angle"
+    if any(w in combined for w in ["scam","fraud","crypto","hack"]):
+        return "dark office computer screen data dramatic cinematic no people"
+    if any(w in combined for w in ["parliament","modi","election","government"]):
+        return "parliament building dome night dramatic lighting cinematic wide angle"
+    if any(w in combined for w in ["economy","inflation","market","rupee"]):
+        return "stock market trading floor screens dramatic lighting cinematic"
+    if any(w in combined for w in ["bollywood","film","cinema"]):
+        return "empty film set camera equipment dramatic studio lighting cinematic"
+    return "dramatic india city skyline dusk golden hour cinematic wide angle"
+
+
+def _rule_summary(article):
+    title = article["title"]
+    desc  = article.get("description", "").strip()
+    if desc and len(desc) > 30:
+        # Trim to ~40 words
+        words = desc.split()
+        short = " ".join(words[:40])
+        if len(words) > 40:
+            short += "..."
+        return short
+    return title + " — Read the full story in the caption below."
+
+
+def _rule_caption(article):
+    title = article["title"]
+    desc  = article.get("description", "")
+    src   = article["source"]["name"]
+    return (f"⚡ {title}\n\n"
+            f"{desc}\n\n"
+            f"📌 Source: {src}\n\n"
+            f"💬 What do YOU think? Comment below 👇\n"
+            f"👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n\n"
+            f"#india #breakingnews #indianews #dailynewsflash #news "
+            f"#indiatoday #ndtv #trending #viral #currentaffairs")
 
 
 # ── ONE combined Gemini call per article (saves quota) ────────────────────────
@@ -175,7 +305,12 @@ CAPTION:
 
     result = call_gemini(prompt)
     if not result:
-        return None, None, None, None
+        # Rule-based fallback so post still looks decent without Gemini
+        kw = _rule_keyword(article)
+        ai_p = _rule_ai_prompt(article)
+        summ = _rule_summary(article)
+        cap  = _rule_caption(article)
+        return kw, ai_p, summ, cap
 
     try:
         keyword, ai_prompt, summary, caption = None, None, None, None
@@ -305,25 +440,47 @@ def fetch_articles(count=5):
         print("All sources failed — no articles available.")
         return []
 
-    # Deduplicate
+    # Deduplicate + filter non-India irrelevant articles
+    NON_INDIA_SKIP = [
+        "guardian", "washington post", "new york times", "fox news",
+        "bbc world", "reuters world", "bloomberg", "cnn world",
+    ]
+    INDIA_BOOST_KEYWORDS = [
+        "india", "indian", "modi", "bjp", "congress", "delhi", "mumbai",
+        "rupee", "isro", "ipl", "cricket", "bollywood", "sc ", "supreme court",
+        "pakistan", "china border", "gujarat", "kerala", "bengal", "punjab",
+        "tamil", "telangana", "andhra", "karnataka", "maharashtra", "rahul",
+    ]
+
     seen, unique = set(), []
     for a in all_articles:
         t = a["title"].strip().lower()
-        if t not in seen and len(t) > 10:
-            seen.add(t)
-            unique.append(a)
-    print(f"Total unique articles: {len(unique)}")
+        src = a["source"]["name"].lower()
+        if t in seen or len(t) < 10:
+            continue
+        seen.add(t)
+        # Downrank clearly non-India foreign stories from non-Indian sources
+        is_foreign_src = any(s in src for s in NON_INDIA_SKIP)
+        has_india_angle = any(k in t for k in INDIA_BOOST_KEYWORDS)
+        if is_foreign_src and not has_india_angle:
+            continue   # skip e.g. Guardian crypto article with no India angle
+        unique.append(a)
+    print(f"Total unique India-relevant articles: {len(unique)}")
+
+    if not unique:
+        print("No India-relevant articles — using all unfiltered")
+        unique = list(seen)  # shouldn't happen but safety net
 
     if len(unique) <= count:
         return unique
 
-    # ONE Gemini call to pick best
+    # ONE Gemini call to pick best — with rule-based fallback
     titles = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(unique[:25])])
     prompt = (
         "You are a viral Indian Instagram news editor.\n"
         f"Pick TOP {count} articles for max engagement from young Indians (18-35).\n"
         "Prioritise: scandals, Supreme Court, cricket, ISRO, crime, protest, govt decisions.\n"
-        "Avoid: celebrity meetups, PR fluff, dry reports, repeated stories.\n\n"
+        "Avoid: celebrity meetups, PR fluff, dry reports, repeated stories, foreign news with no India angle.\n\n"
         f"{titles}\n\n"
         "Reply with ONLY comma-separated numbers. Example: 3,7,1,12,5\nNothing else."
     )
@@ -337,6 +494,22 @@ def fetch_articles(count=5):
                 return [unique[n-1] for n in nums]
         except Exception as e:
             print(f"Pick parse error: {e}")
+
+    # Smart rule-based fallback — score articles by India relevance
+    def score(a):
+        t = a["title"].lower()
+        d = a.get("description","").lower()
+        s = 0
+        for k in INDIA_BOOST_KEYWORDS:
+            if k in t: s += 3
+            if k in d: s += 1
+        high_engage = ["murder","scam","rape","arrest","court","verdict","protest",
+                       "cricket","ipl","bollywood","isro","explosion","flood","crash"]
+        for k in high_engage:
+            if k in t: s += 5
+        return s
+    unique.sort(key=score, reverse=True)
+    print("Using rule-based article ranking (Gemini unavailable)")
     return unique[:count]
 
 
@@ -401,9 +574,12 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
                         f.write(chunk)
                 img = Image.open(save_path)
                 w, h = img.size
-                if w >= 400 and h >= 400:
+                # Reject tiny images or extreme aspect ratios
+                if w >= 500 and h >= 500 and 0.5 <= w/h <= 2.0:
                     print(f"Real photo from {src_name} ({w}x{h})")
                     return save_path, src_name
+                else:
+                    print(f"Rejected image: too small or wrong ratio ({w}x{h})")
         except Exception as e:
             print(f"Photo download error: {e}")
 
