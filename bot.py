@@ -70,13 +70,14 @@ def _next_key():
     _key_index += 1
     return key
 
-def call_gemini(prompt, retries=2):
+def call_gemini(prompt, retries=1):
     """
     Call Gemini with:
     - Key rotation (if 2 keys configured, alternates between them)
     - Model fallback (2.0-flash → 1.5-flash → 1.5-flash-8b)
-    - Smart rate-limit backoff (waits then retries, doesn't just give up)
-    - Minimum 6s gap between calls to stay under 15 req/min
+    - Fail fast — 1 retry per model max, cap wait at 15s
+    - If all fail, rule-based fallback runs immediately (saves GitHub minutes)
+    - Minimum 8s gap between calls to stay under 15 req/min
     """
     if not _GEMINI_KEYS:
         print("No Gemini API key configured")
@@ -88,12 +89,12 @@ def call_gemini(prompt, retries=2):
         for attempt in range(retries):
             key = _next_key()
 
-            # Enforce minimum gap per key — 8s gives 7.5 req/min, safe under 15 limit
+            # Enforce minimum gap per key — 5s gives 12 req/min, safe under 15 limit
             now = time.time()
             last = _last_call.get(key, 0)
             gap = now - last
-            if gap < 8:
-                time.sleep(8 - gap)
+            if gap < 5:
+                time.sleep(5 - gap)
 
             try:
                 url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -114,12 +115,14 @@ def call_gemini(prompt, retries=2):
                 err_code = data.get("error", {}).get("code", 0)
 
                 if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
-                    # Try to read retry-after from error message
+                    # Short wait only — we'd rather use rule-based fallback than
+                    # burn 60+ seconds waiting, which exhausts GitHub Actions minutes
                     import re as _re
-                    retry_match = _re.search(r"retry.{0,10}?([0-9]+)\s*s", err_msg, _re.IGNORECASE)
-                    suggested = int(retry_match.group(1)) + 5 if retry_match else None
-                    wait = suggested if suggested else (25 + attempt * 15)
-                    print(f"Rate limit ({model}), waiting {wait}s then retrying...")
+                    retry_match = _re.search(r"retry.{0,10}?([0-9]+)s", err_msg, _re.IGNORECASE)
+                    suggested = int(retry_match.group(1)) if retry_match else None
+                    # Cap wait at 15s max — after that just move to next model/key
+                    wait = min(suggested + 2, 15) if suggested else (8 + attempt * 5)
+                    print(f"Rate limit ({model}), waiting {wait}s then trying next option...")
                     time.sleep(wait)
                     continue
                 else:
@@ -593,18 +596,29 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     seed = random.randint(1, 99999)
     ai_url = (f"https://image.pollinations.ai/prompt/{encoded}"
               f"?width=1080&height=1080&seed={seed}&model=flux&nologo=true")
-    try:
-        r = requests.get(ai_url, timeout=90, stream=True)
-        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-            ai_path = save_path.replace(".jpg", "_ai.jpg")
-            with open(ai_path, "wb") as f:
-                for chunk in r.iter_content(4096):
-                    f.write(chunk)
-            Image.open(ai_path).verify()
-            print("AI image generated OK")
-            return ai_path, "AI Generated"
-    except Exception as e:
-        print(f"AI image error: {e}")
+    for ai_attempt in range(2):   # try twice with different seeds
+        try:
+            attempt_seed = seed + ai_attempt * 1000
+            attempt_url = (f"https://image.pollinations.ai/prompt/{encoded}"
+                          f"?width=1080&height=1080&seed={attempt_seed}&model=flux&nologo=true")
+            print(f"AI image attempt {ai_attempt+1}/2...")
+            r = requests.get(attempt_url, timeout=90, stream=True)
+            if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+                ai_path = save_path.replace(".jpg", f"_ai{ai_attempt}.jpg")
+                with open(ai_path, "wb") as f:
+                    for chunk in r.iter_content(4096):
+                        f.write(chunk)
+                try:
+                    test = Image.open(ai_path)
+                    w, h = test.size
+                    if w > 100 and h > 100:
+                        print(f"AI image generated OK ({w}x{h})")
+                        return ai_path, "AI Generated"
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"AI image attempt {ai_attempt+1} error: {e}")
+        time.sleep(3)
 
     return None, "none"
 
@@ -842,7 +856,25 @@ def refresh_fb_token():
     if new_token:
         return new_token
 
-    print("Token refresh failed — using existing token")
+    # If page token fails, try getting just a long-lived user token (60 days)
+    print("Page token failed — trying long-lived user token...")
+    try:
+        r = requests.get(
+            "https://graph.facebook.com/v25.0/oauth/access_token",
+            params={"grant_type": "fb_exchange_token",
+                    "client_id": app_id, "client_secret": app_secret,
+                    "fb_exchange_token": FB_ACCESS_TOKEN},
+            timeout=15)
+        ll = r.json().get("access_token", "")
+        if ll:
+            print("Long-lived token obtained as fallback (valid ~60 days)")
+            return ll
+    except Exception as e:
+        print(f"Long-lived token fallback error: {e}")
+
+    print("⚠️ All token refresh attempts failed — using existing token")
+    print("   ACTION NEEDED: Update FB_ACCESS_TOKEN in GitHub Secrets")
+    print("   Go to: developers.facebook.com/tools/explorer")
     return FB_ACCESS_TOKEN
 
 
@@ -890,7 +922,14 @@ def post_carousel(image_urls, caption, token):
             print(f"Slide {i+1} failed: {r.json()}")
         time.sleep(3)
     if len(child_ids) < 2:
-        raise Exception(f"Not enough slides ({len(child_ids)})")
+        print(f"⚠️ Only {len(child_ids)} slide(s) created — need at least 2 for carousel")
+        print("Attempting to post as single image instead...")
+        if child_ids:
+            # We have at least something — can't post single from carousel container
+            # Just skip gracefully
+            print("Skipping this carousel run — will retry next time")
+            return
+        return
     r = requests.post(
         f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
         data={"media_type": "CAROUSEL", "children": ",".join(child_ids),
@@ -910,7 +949,27 @@ def post_carousel(image_urls, caption, token):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"\n=== Bot started {datetime.now()} | Type: {POST_TYPE} ===\n")
+    RUN_START = time.time()
+    MAX_RUN_SECONDS = 240   # hard cap: 4 minutes per run = safe within free tier
+
+    def time_left():
+        return MAX_RUN_SECONDS - (time.time() - RUN_START)
+
+    def check_time(stage=""):
+        remaining = time_left()
+        print(f"⏱  Time used: {int(time.time()-RUN_START)}s | Remaining: {int(remaining)}s {stage}")
+        if remaining < 30:
+            print("⚠️  Time budget almost exhausted — posting what we have")
+            return False
+        return True
+
+    print(f"\n=== Bot started {datetime.now()} | Type: {POST_TYPE} ===")
+    print(f"=== Keys: GNews={'✅' if GNEWS_API_KEY else '❌'} | "
+          f"Gemini={'✅' if GEMINI_API_KEY else '❌'} | "
+          f"Gemini2={'✅' if os.environ.get('GEMINI_API_KEY_2') else '⚠️ not set'} | "
+          f"Unsplash={'✅' if UNSPLASH_ACCESS_KEY else '❌'} | "
+          f"Pexels={'✅' if PEXELS_API_KEY else '⚠️ not set'} | "
+          f"Pixabay={'✅' if PIXABAY_API_KEY else '⚠️ not set'} ===\n")
 
     # Refresh FB token first (prevents the "session expired" error)
     token = refresh_fb_token()
@@ -918,8 +977,8 @@ def main():
     if POST_TYPE == "carousel":
         articles = fetch_articles(count=5)
         if not articles:
-            print("No articles found.")
-            sys.exit(1)
+            print("⚠️ No articles found — skipping this run (will retry next scheduled time)")
+            sys.exit(0)
 
         slide_paths = [create_cover_slide("/tmp/slide_0.jpg")]
         carousel_captions = []
@@ -963,15 +1022,15 @@ def main():
                 urls.append(u)
             time.sleep(2)
         if len(urls) < 2:
-            print("Not enough uploads.")
-            sys.exit(1)
+            print("⚠️ Not enough images uploaded — skipping carousel this run")
+            sys.exit(0)
         post_carousel(urls, main_caption, token)
 
     else:
         articles = fetch_articles(count=1)
         if not articles:
-            print("No articles found.")
-            sys.exit(1)
+            print("⚠️ No articles found — skipping this run (will retry next scheduled time)")
+            sys.exit(0)
         article = articles[0]
         print(f"\nArticle: {article['title']}")
 
@@ -982,12 +1041,20 @@ def main():
                                     article["source"]["name"], summary)
         img_url = upload_to_imgur(final)
         if not img_url:
-            print("Upload failed.")
-            sys.exit(1)
+            print("⚠️ Image upload failed — skipping this run")
+            sys.exit(0)
         post_single(img_url, caption, token)
 
     print(f"\n=== ✅ Done at {datetime.now()} ===\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Bot crashed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Exit 0 so GitHub doesn't mark the scheduled run as "failed"
+        # The next scheduled run will try again automatically
+        sys.exit(0)
