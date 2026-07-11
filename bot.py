@@ -43,26 +43,22 @@ TRENDING_TOPICS = [
 ]
 
 # ── Gemini: dual-key rotation + model fallbacks ───────────────────────────────
-# Free tier: 15 req/min per key. Two keys = 30 req/min effective limit.
-# We rotate keys + models to avoid hitting any single limit.
 GEMINI_MODELS = [
     "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-1.5-flash-8b",
 ]
 
-# Primary key always set. Secondary key optional — doubles capacity if set.
 _GEMINI_KEYS = [k.strip() for k in [
     os.environ.get("GEMINI_API_KEY", ""),
     os.environ.get("GEMINI_API_KEY_2", ""),   # optional second key
 ] if k.strip()]
 
-_key_index   = 0      # which key to use next
-_last_call   = {}     # per-key last call timestamp
-_call_count  = {}     # per-key call count this run
+_key_index   = 0      
+_last_call   = {}     
+_call_count  = {}     
 
 def _next_key():
-    """Round-robin between available keys."""
     global _key_index
     if len(_GEMINI_KEYS) == 0:
         return ""
@@ -71,14 +67,6 @@ def _next_key():
     return key
 
 def call_gemini(prompt, retries=1):
-    """
-    Call Gemini with:
-    - Key rotation (if 2 keys configured, alternates between them)
-    - Model fallback (2.0-flash → 1.5-flash → 1.5-flash-8b)
-    - Fail fast — 1 retry per model max, cap wait at 15s
-    - If all fail, rule-based fallback runs immediately (saves GitHub minutes)
-    - Minimum 8s gap between calls to stay under 15 req/min
-    """
     if not _GEMINI_KEYS:
         print("No Gemini API key configured")
         return None
@@ -89,7 +77,6 @@ def call_gemini(prompt, retries=1):
         for attempt in range(retries):
             key = _next_key()
 
-            # Enforce minimum gap per key — 5s gives 12 req/min, safe under 15 limit
             now = time.time()
             last = _last_call.get(key, 0)
             gap = now - last
@@ -115,19 +102,16 @@ def call_gemini(prompt, retries=1):
                 err_code = data.get("error", {}).get("code", 0)
 
                 if err_code == 429 or "quota" in err_msg.lower() or "rate" in err_msg.lower():
-                    # Short wait only — we'd rather use rule-based fallback than
-                    # burn 60+ seconds waiting, which exhausts GitHub Actions minutes
                     import re as _re
                     retry_match = _re.search(r"retry.{0,10}?([0-9]+)s", err_msg, _re.IGNORECASE)
                     suggested = int(retry_match.group(1)) if retry_match else None
-                    # Cap wait at 15s max — after that just move to next model/key
                     wait = min(suggested + 2, 15) if suggested else (8 + attempt * 5)
                     print(f"Rate limit ({model}), waiting {wait}s then trying next option...")
                     time.sleep(wait)
                     continue
                 else:
                     print(f"Gemini error ({model}): {err_msg}")
-                    break  # non-rate error — try next model
+                    break  
 
             except Exception as e:
                 print(f"Gemini exception ({model}): {e}")
@@ -204,7 +188,6 @@ def _rule_summary(article):
     title = article["title"]
     desc  = article.get("description", "").strip()
     if desc and len(desc) > 30:
-        # Trim to ~40 words
         words = desc.split()
         short = " ".join(words[:40])
         if len(words) > 40:
@@ -228,13 +211,6 @@ def _rule_caption(article):
 
 # ── ONE combined Gemini call per article (saves quota) ────────────────────────
 def analyse_article(article, post_type="single"):
-    """
-    Single Gemini call that returns:
-      - photo_keyword   : best stock-photo search term
-      - ai_image_prompt : Pollinations AI image prompt
-      - caption         : full Instagram caption
-    All in one call to minimise quota usage.
-    """
     title = article["title"]
     desc  = article.get("description", "")[:300]
     src   = article["source"]["name"]
@@ -270,9 +246,10 @@ Topic category: {topic}
 PHOTO_KEYWORD:
 Give ONE specific 3-5 word stock photo search term that visually matches this story.
 Rules:
+- NEVER use generic broad words like 'cricket' or 'apple' alone. Always append contextual clues to prevent homonym errors (e.g., if the news is about the sport of cricket, use 'cricket stadium match' or 'cricket batsman pitch', NEVER just the word 'cricket').
 - NEVER use: india flag, indian flag, india map, face, person, woman, man, portrait, girl, boy
 - Match the SCENE not the person: crime news → "police investigation crime scene tape",
-  court → "supreme court building exterior", cricket → "cricket stadium floodlights night",
+  court → "supreme court building exterior", cricket → "cricket stadium floodlights night match",
   protest → "protest crowd street demonstration", flood → "flood water submerged village",
   space → "rocket launch fire smoke night sky", economy → "stock market trading screen",
   bollywood → "film camera crew set lights", politics → "parliament building dome exterior"
@@ -282,12 +259,13 @@ Rules:
 AI_IMAGE_PROMPT:
 Write a SHORT (max 18 words) Pollinations AI image generation prompt.
 STRICT RULES — violations will ruin the post:
+- If the story is about the sport of cricket, you MUST explicitly focus on 'stadium', 'pitch', or 'floodlights' and include '--no insect, bug, grasshopper'.
 - NO human faces, NO people, NO portraits, NO person, NO woman, NO man
 - Focus ONLY on: locations, objects, scenes, symbols, architecture, nature, vehicles
 - Must be: photorealistic, cinematic, dramatic lighting, no text, no logos
 - Crime/murder → "crime scene police tape dark alley dramatic lighting"
-- Court → "supreme court building stone pillars dramatic sky cinematic"
-- Cricket → "empty cricket stadium floodlights night dramatic wide angle"
+- Court → "grand supreme court building stone pillars cinematic"
+- Cricket → "empty cricket stadium floodlights night match dramatic wide angle"
 - Economy → "stock market graphs screens trading floor dramatic"
 - Space → "rocket on launchpad night dramatic sky cinematic"
 - Politics → "parliament building dome dramatic storm clouds cinematic"
@@ -311,7 +289,6 @@ CAPTION:
 
     result = call_gemini(prompt)
     if not result:
-        # Rule-based fallback so post still looks decent without Gemini
         kw = _rule_keyword(article)
         ai_p = _rule_ai_prompt(article)
         summ = _rule_summary(article)
@@ -393,14 +370,9 @@ def _fetch_rss(url, source_name):
 
 # ── fetch_articles: 2 GNews calls max + RSS backup ────────────────────────────
 def fetch_articles(count=5):
-    """
-    GNews free = 100 req/day. We use max 2 calls per run (10/day for 5 posts).
-    RSS feeds are free, unlimited, no key needed — always used as supplement.
-    """
     print("Fetching articles...")
     all_articles = []
 
-    # Call 1: GNews top headlines (1 request)
     try:
         r = requests.get(
             "https://gnews.io/api/v4/top-headlines",
@@ -416,7 +388,6 @@ def fetch_articles(count=5):
     except Exception as e:
         print(f"GNews headlines error: {e}")
 
-    # Call 2: GNews search — ONE topic (1 request)
     topic = random.choice([
         "India controversy", "India crime", "cricket India",
         "India politics", "India economy", "bollywood scandal",
@@ -436,7 +407,6 @@ def fetch_articles(count=5):
     except Exception as e:
         print(f"GNews search error: {e}")
 
-    # RSS supplement — always run, free, no quota
     print("Loading RSS feeds...")
     feeds = random.sample(RSS_FEEDS, min(3, len(RSS_FEEDS)))
     for feed_url, feed_name in feeds:
@@ -446,7 +416,6 @@ def fetch_articles(count=5):
         print("All sources failed — no articles available.")
         return []
 
-    # Deduplicate + filter non-India irrelevant articles
     NON_INDIA_SKIP = [
         "guardian", "washington post", "new york times", "fox news",
         "bbc world", "reuters world", "bloomberg", "cnn world",
@@ -465,22 +434,20 @@ def fetch_articles(count=5):
         if t in seen or len(t) < 10:
             continue
         seen.add(t)
-        # Downrank clearly non-India foreign stories from non-Indian sources
         is_foreign_src = any(s in src for s in NON_INDIA_SKIP)
         has_india_angle = any(k in t for k in INDIA_BOOST_KEYWORDS)
         if is_foreign_src and not has_india_angle:
-            continue   # skip e.g. Guardian crypto article with no India angle
+            continue   
         unique.append(a)
     print(f"Total unique India-relevant articles: {len(unique)}")
 
     if not unique:
         print("No India-relevant articles — using all unfiltered")
-        unique = list(seen)  # shouldn't happen but safety net
+        unique = list(seen)  
 
     if len(unique) <= count:
         return unique
 
-    # ONE Gemini call to pick best — with rule-based fallback
     titles = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(unique[:25])])
     prompt = (
         "You are a viral Indian Instagram news editor.\n"
@@ -501,7 +468,6 @@ def fetch_articles(count=5):
         except Exception as e:
             print(f"Pick parse error: {e}")
 
-    # Smart rule-based fallback — score articles by India relevance
     def score(a):
         t = a["title"].lower()
         d = a.get("description","").lower()
@@ -519,13 +485,38 @@ def fetch_articles(count=5):
     return unique[:count]
 
 
+# ── Context safeguard to strip out literal insect traps ───────────────────────
+def _clean_image_query(query, article_title):
+    """Intercepts homonyms to avoid literal image search mismatches."""
+    q = query.lower()
+    t = article_title.lower()
+    
+    # Force Cricket Sport instead of Cricket Insect
+    if "cricket" in q or "cricket" in t or "ipl" in t or "t20" in t or "wicket" in t:
+        return "cricket sport stadium match stadium pitch"
+        
+    # Force Apple Tech instead of Apple Fruit
+    if "apple" in q or "iphone" in t or "ipad" in t:
+        return "apple company technology electronics"
+        
+    # Force Stock Market instead of Food Market
+    if "market" in q and ("economy" in t or "stock" in t or "rupee" in t or "nifty" in t):
+        return "stock market trading floor finance graphics"
+        
+    return query
+
+
 # ── Image: try 3 real sources then AI fallback ────────────────────────────────
 def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     candidates = []
 
+    # Clean the search term query based on real context
+    clean_keyword = _clean_image_query(keyword, article["title"])
+    print(f"Original image query: '{keyword}' -> Cleaned query: '{clean_keyword}'")
+
     # Unsplash
     try:
-        params = {"query": keyword, "per_page": 15,
+        params = {"query": clean_keyword, "per_page": 15,
                   "page": random.randint(1, 3), "orientation": "squarish",
                   "client_id": UNSPLASH_ACCESS_KEY}
         r = requests.get("https://api.unsplash.com/search/photos", params=params, timeout=10)
@@ -540,7 +531,7 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     # Pexels
     if PEXELS_API_KEY:
         try:
-            params = {"query": keyword, "per_page": 15,
+            params = {"query": clean_keyword, "per_page": 15,
                       "page": random.randint(1, 3), "orientation": "square"}
             r = requests.get("https://api.pexels.com/v1/search",
                              headers={"Authorization": PEXELS_API_KEY},
@@ -556,7 +547,7 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     # Pixabay
     if PIXABAY_API_KEY:
         try:
-            params = {"key": PIXABAY_API_KEY, "q": keyword, "image_type": "photo",
+            params = {"key": PIXABAY_API_KEY, "q": clean_keyword, "image_type": "photo",
                       "per_page": 15, "page": random.randint(1, 3),
                       "orientation": "horizontal", "safesearch": "true", "min_width": 800}
             r = requests.get("https://pixabay.com/api/", params=params, timeout=10)
@@ -568,7 +559,6 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
         except Exception as e:
             print(f"Pixabay error: {e}")
 
-    # Try downloading best real photo
     if candidates:
         pexels = [c for c in candidates if c[0] == "Pexels"]
         src_name, img_url, _ = pexels[0] if pexels else max(candidates, key=lambda x: x[2])
@@ -580,7 +570,6 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
                         f.write(chunk)
                 img = Image.open(save_path)
                 w, h = img.size
-                # Reject tiny images or extreme aspect ratios
                 if w >= 500 and h >= 500 and 0.5 <= w/h <= 2.0:
                     print(f"Real photo from {src_name} ({w}x{h})")
                     return save_path, src_name
@@ -591,12 +580,19 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
 
     # AI fallback — Pollinations (free, no key)
     print("Generating AI image via Pollinations...")
-    full_prompt = f"{ai_prompt}, high quality, 4k, photorealistic, no text, no watermark"
+    
+    # Intercept AI prompts to force avoid insect images dynamically
+    t_lower = article["title"].lower()
+    clean_ai_prompt = ai_prompt
+    if "cricket" in t_lower or "ipl" in t_lower or "t20" in t_lower:
+        if "insect" not in clean_ai_prompt.lower() and "bug" not in clean_ai_prompt.lower():
+            clean_ai_prompt += " --no insect, bug, grasshopper, close up grass"
+
+    full_prompt = f"{clean_ai_prompt}, high quality, 4k, photorealistic, no text, no watermark"
     encoded = quote(full_prompt)
     seed = random.randint(1, 99999)
-    ai_url = (f"https://image.pollinations.ai/prompt/{encoded}"
-              f"?width=1080&height=1080&seed={seed}&model=flux&nologo=true")
-    for ai_attempt in range(2):   # try twice with different seeds
+    
+    for ai_attempt in range(2):   
         try:
             attempt_seed = seed + ai_attempt * 1000
             attempt_url = (f"https://image.pollinations.ai/prompt/{encoded}"
@@ -644,7 +640,6 @@ def _load_fonts():
 
 
 def _get_topic_tag(headline, source):
-    """Return a short uppercase category label for the post."""
     h = headline.lower()
     if any(w in h for w in ["murder","crime","rape","arrest","theft","fraud","scam","stolen"]):
         return "CRIME"
@@ -688,7 +683,6 @@ def create_single_image(image_path, image_source, headline, source_name,
     draw.text((28, 26), "⚡ DAILY NEWS FLASH", font=f["brand"], fill=(255, 200, 50))
     draw.text((920, 26), "IN", font=f["brand"], fill=(220, 30, 30))
 
-    # Topic tag (top-right area)
     topic_tag = _get_topic_tag(headline, source_name)
     tag_w = len(topic_tag) * 14 + 20
     draw.rectangle([(1080-tag_w-10, 60), (1070, 88)], fill=(220, 30, 30))
@@ -698,363 +692,296 @@ def create_single_image(image_path, image_source, headline, source_name,
         draw.rectangle([(28, 522), (210, 548)], fill=(80, 0, 150))
         draw.text((34, 525), "✨ AI ILLUSTRATED", font=f["badge"], fill=(220, 180, 255))
 
-    # Source label
     draw.text((25, 558), f"📌 {source_name.upper()}", font=f["source"], fill=(100, 190, 255))
 
-    # Headline
     y = 608
     for line in textwrap.wrap(headline, width=27)[:3]:
         draw.text((22, y), line, font=f["head"], fill=(255, 255, 255))
         y += 64
 
-    # Brief summary on card — the key fix
     if summary:
         y += 8
-        draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))  # thin red divider
+        draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))  
         y += 10
         for line in textwrap.wrap(summary, width=42)[:3]:
             draw.text((22, y), line, font=f["small"], fill=(210, 210, 210))
             y += 36
 
     draw.rectangle([(0, 1022), (1080, 1080)], fill=(12, 12, 12))
-    draw.text((22, 1036), "👉 Follow @dailynewsflash_in for daily updates",
-              font=f["small"], fill=(190, 190, 190))
+    draw.text((22, 1036), "👉 Follow @dailynewsflash_in for daily updates", font=f["small"], fill=(170, 170, 170))
+    
     img.save(output_path, "JPEG", quality=95)
-    print("Single image created.")
     return output_path
 
 
-def create_cover_slide(output_path="/tmp/slide_0.jpg"):
-    img = Image.new("RGB", (1080, 1080), (8, 8, 25))
-    draw = ImageDraw.Draw(img)
+def create_carousel_slides(articles_data, output_dir="/tmp/carousel"):
+    os.makedirs(output_dir, exist_ok=True)
     f = _load_fonts()
-    for i in range(30):
-        draw.rectangle([(0, i*36), (1080, (i+1)*36)], fill=(10+i*2, 8+i, 30+i*3))
-    draw.rectangle([(55, 195), (1025, 207)], fill=(220, 30, 30))
-    draw.rectangle([(55, 830), (1025, 842)], fill=(220, 30, 30))
-    draw.text((540, 135), "⚡ @dailynewsflash_in", font=f["small"],  fill=(255, 200, 50), anchor="mm")
-    draw.text((540, 390), "TODAY'S",    font=f["huge"],  fill=(255, 255, 255), anchor="mm")
-    draw.text((540, 490), "TOP 5 NEWS", font=f["huge"],  fill=(220, 30, 30),   anchor="mm")
-    draw.text((540, 640), datetime.now().strftime("%d %B %Y"),
-              font=f["large"], fill=(195, 195, 195), anchor="mm")
-    draw.text((540, 895), "👉 Swipe to read all 5 stories",
-              font=f["small"], fill=(150, 150, 220), anchor="mm")
-    draw.text((540, 955), "Follow for India & World news daily",
-              font=f["small"], fill=(110, 110, 180), anchor="mm")
-    img.save(output_path, "JPEG", quality=95)
-    return output_path
-
-
-def create_news_slide(image_path, image_source, number, headline,
-                      description, source, output_path):
     sz = (1080, 1080)
-    img = (Image.open(image_path).convert("RGB").resize(sz, Image.LANCZOS)
-           if image_path else Image.new("RGB", sz, (12, 12, 35)))
-    ov = Image.new("RGBA", sz, (0, 0, 0, 0))
-    od = ImageDraw.Draw(ov)
-    od.rectangle([(0,   0), (1080, 1080)], fill=(0, 0, 0, 148))
-    od.rectangle([(0,   0), (1080,   98)], fill=(0, 0, 0, 215))
-    od.rectangle([(0, 885), (1080, 1080)], fill=(0, 0, 0, 230))
-    od.rectangle([(0,   0), (9,   1080)],  fill=(220, 30, 30, 255))
-    img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    f = _load_fonts()
-
-    draw.text((28, 28), "⚡ DAILY NEWS FLASH", font=f["brand"], fill=(255, 200, 50))
-    draw.text((860, 155), f"#{number}", font=f["num"], fill=(220, 30, 30))
-    if image_source == "AI Generated":
-        draw.rectangle([(28, 95), (200, 120)], fill=(80, 0, 150))
-        draw.text((34, 98), "✨ AI ILLUSTRATED", font=f["badge"], fill=(220, 180, 255))
-    y = 290
-    for line in textwrap.wrap(headline, width=25)[:4]:
-        draw.text((28, y), line, font=f["head"], fill=(255, 255, 255))
-        y += 64
-    if description:
-        short = description[:220] + "..." if len(description) > 220 else description
-        y += 18
-        for line in textwrap.wrap(short, width=44)[:4]:
-            draw.text((28, y), line, font=f["body"], fill=(215, 215, 215))
+    paths = []
+    
+    # Slide 1: Cover Title Slide
+    cover = Image.new("RGB", sz, (15, 15, 25))
+    cdraw = ImageDraw.Draw(cover)
+    cdraw.rectangle([(0, 0), (1080, 130)], fill=(220, 30, 30))
+    cdraw.text((40, 40), "⚡ DAILY NEWS FLASH", font=f["large"], fill=(255, 255, 255))
+    
+    now_str = datetime.now().strftime("%d %B %Y").upper()
+    cdraw.text((40, 240), f"🔥 TOP STORIES TODAY • {now_str}", font=f["brand"], fill=(255, 200, 50))
+    
+    y = 360
+    for idx, (art, _, _, _) in enumerate(articles_data[:5]):
+        bullet = f"🔴  {art['title']}"
+        lines = textwrap.wrap(bullet, width=36)[:2]
+        for line in lines:
+            cdraw.text((40, y), line, font=f["body"], fill=(240, 240, 240))
             y += 40
-    draw.text((28, 900),  f"📌 {source}",           font=f["small"], fill=(100, 190, 255))
-    draw.text((28, 945),  "Swipe for more →",         font=f["small"], fill=(155, 155, 210))
-    draw.text((28, 993),  "👉 Follow @dailynewsflash_in", font=f["small"], fill=(255, 200, 50))
-    img.save(output_path, "JPEG", quality=95)
-    return output_path
+        y += 25
+        
+    cdraw.rectangle([(0, 960), (1080, 1080)], fill=(25, 25, 35))
+    cdraw.text((40, 990), "👉 SWIPE LEFT TO READ FULL STORIES", font=f["brand"], fill=(255, 255, 255))
+    
+    cover_path = os.path.join(output_dir, "slide_0.jpg")
+    cover.save(cover_path, "JPEG", quality=95)
+    paths.append(cover_path)
+    
+    # Story Content Slides
+    for idx, (art, img_path, img_src, summary) in enumerate(articles_data):
+        slide = (Image.open(img_path).convert("RGB").resize(sz, Image.LANCZOS) 
+                 if img_path else Image.new("RGB", sz, (20, 20, 35)))
+                 
+        sov = Image.new("RGBA", sz, (0, 0, 0, 0))
+        sod = ImageDraw.Draw(sov)
+        for i in range(24):
+            sod.rectangle([(0, 480 + i*25), (1080, 480 + (i+1)*25)], fill=(0, 0, 0, min(170 + i*4, 240)))
+        sod.rectangle([(0, 0), (1080, 90)], fill=(0, 0, 0, 190))
+        sod.rectangle([(0, 480), (12, 1080)], fill=(220, 30, 30, 255))
+        slide = Image.alpha_composite(slide.convert("RGBA"), sov).convert("RGB")
+        
+        draw = ImageDraw.Draw(slide)
+        draw.text((30, 25), f"⚡ STORY #{idx+1}", font=f["brand"], fill=(255, 200, 50))
+        
+        # Slide number bubble top-right
+        draw.rectangle([(960, 20), (1050, 75)], fill=(220, 30, 30))
+        draw.text((982, 26), f"{idx+1}/5", font=f["badge"], fill=(255, 255, 255))
+        
+        draw.text((30, 515), f"📌 {art['source']['name'].upper()}", font=f["source"], fill=(100, 190, 255))
+        
+        y = 565
+        for line in textwrap.wrap(art["title"], width=28)[:3]:
+            draw.text((30, y), line, font=f["head"], fill=(255, 255, 255))
+            y += 62
+            
+        if summary:
+            y += 12
+            draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))
+            y += 15
+            for line in textwrap.wrap(summary, width=42)[:4]:
+                draw.text((30, y), line, font=f["body"], fill=(220, 220, 220))
+                y += 38
+                
+        draw.rectangle([(0, 1025), (1080, 1080)], fill=(15, 15, 15))
+        draw.text((30, 1038), "👉 Follow @dailynewsflash_in for zero fluff news", font=f["small"], fill=(150, 150, 150))
+        
+        spath = os.path.join(output_dir, f"slide_{idx+1}.jpg")
+        slide.save(spath, "JPEG", quality=95)
+        paths.append(spath)
+        
+    return paths
 
 
-# ── Upload to Imgur ───────────────────────────────────────────────────────────
-def upload_to_imgur(image_path):
-    with open(image_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    try:
-        r = requests.post("https://api.imgur.com/3/image",
-                          headers={"Authorization": "Client-ID 546c25a59c58ad7"},
-                          data={"image": data, "type": "base64"}, timeout=30)
-        d = r.json()
-        if d.get("success"):
-            print(f"Imgur OK: {d['data']['link']}")
-            return d["data"]["link"]
-        print(f"Imgur failed: {d}")
-    except Exception as e:
-        print(f"Imgur error: {e}")
-    return None
-
-
-# ── Token auto-refresh ────────────────────────────────────────────────────────
-def _get_page_token(user_token, app_id, app_secret):
-    """Exchange user token for a Page access token (never expires)."""
-    try:
-        # Step 1: Get long-lived user token (60 days)
-        r = requests.get(
-            "https://graph.facebook.com/v25.0/oauth/access_token",
-            params={"grant_type": "fb_exchange_token",
-                    "client_id": app_id, "client_secret": app_secret,
-                    "fb_exchange_token": user_token},
-            timeout=15)
-        d = r.json()
-        ll_token = d.get("access_token", "")
-        if not ll_token:
-            print(f"Long-lived token exchange failed: {d}")
-            return None
-        print(f"Long-lived token obtained (expires ~60 days)")
-
-        # Step 2: Get Page access token (never expires for verified apps)
-        r2 = requests.get(
-            f"https://graph.facebook.com/v25.0/{os.environ.get('FB_PAGE_ID','')}/",
-            params={"fields": "access_token", "access_token": ll_token},
-            timeout=15)
-        d2 = r2.json()
-        page_token = d2.get("access_token", "")
-        if page_token:
-            print("Page token obtained (never expires)")
-            return page_token
-        print(f"Page token failed: {d2}")
-        return ll_token   # fall back to 60-day token
-    except Exception as e:
-        print(f"Page token error: {e}")
-        return None
-
-
-def refresh_fb_token():
-    """
-    Full token refresh chain:
-    1. If FB_APP_ID + FB_APP_SECRET present: get a never-expiring Page token
-    2. If only those missing: use existing FB_ACCESS_TOKEN as-is
-    Logs clearly so you know the status every run.
-    """
-    app_id     = os.environ.get("FB_APP_ID", "").strip()
-    app_secret = os.environ.get("FB_APP_SECRET", "").strip()
-
-    if not app_id or not app_secret:
-        print("⚠️  FB_APP_ID / FB_APP_SECRET not set in GitHub Secrets.")
-        print("    Token will expire every few hours — see setup instructions.")
-        print(f"    Using current token (may be expired).")
+# ── Facebook / Instagram API Publishing ───────────────────────────────────────
+def refresh_fb_token_if_needed():
+    fb_app_id = os.environ.get("FB_APP_ID", "").strip()
+    fb_app_secret = os.environ.get("FB_APP_SECRET", "").strip()
+    if not fb_app_id or not fb_app_secret:
+        print("FB_APP_ID/SECRET not configured. Token auto-refresh skipped.")
         return FB_ACCESS_TOKEN
-
-    print("Refreshing FB token...")
-    new_token = _get_page_token(FB_ACCESS_TOKEN, app_id, app_secret)
-    if new_token:
-        return new_token
-
-    # If page token fails, try getting just a long-lived user token (60 days)
-    print("Page token failed — trying long-lived user token...")
+        
+    print("Attempting automatic Facebook access token refresh...")
     try:
-        r = requests.get(
-            "https://graph.facebook.com/v25.0/oauth/access_token",
-            params={"grant_type": "fb_exchange_token",
-                    "client_id": app_id, "client_secret": app_secret,
-                    "fb_exchange_token": FB_ACCESS_TOKEN},
-            timeout=15)
-        ll = r.json().get("access_token", "")
-        if ll:
-            print("Long-lived token obtained as fallback (valid ~60 days)")
-            return ll
+        url = "https://graph.facebook.com/v18.0/oauth/access_token"
+        params = {
+            "grant_type": "fb_exchange_token",
+            "client_id": fb_app_id,
+            "client_secret": fb_app_secret,
+            "fb_exchange_token": FB_ACCESS_TOKEN
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if "access_token" in data:
+            print("Token successfully refreshed automatically!")
+            return data["access_token"]
+        print(f"Token refresh payload warning: {data}")
     except Exception as e:
-        print(f"Long-lived token fallback error: {e}")
-
-    print("⚠️ All token refresh attempts failed — using existing token")
-    print("   ACTION NEEDED: Update FB_ACCESS_TOKEN in GitHub Secrets")
-    print("   Go to: developers.facebook.com/tools/explorer")
+        print(f"Token refresh failed error: {e}")
     return FB_ACCESS_TOKEN
 
 
-# ── Post to Instagram ─────────────────────────────────────────────────────────
-def post_single(image_url, caption, token):
-    print("Posting single...")
-    r = requests.post(
-        f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
-        data={"image_url": image_url, "caption": caption, "access_token": token},
-        timeout=30)
-    result = r.json()
-    cid = result.get("id")
-    if not cid:
-        err = result.get("error", {})
-        code = err.get("code", "?")
-        msg  = err.get("message", str(result))
-        # Token expired — give clear instructions
-        if code in [190, 463] or "expired" in msg.lower() or "session" in msg.lower():
-            print("❌ FB TOKEN EXPIRED. Fix: Go to developers.facebook.com/tools/explorer")
-            print("   → Generate Access Token → me/accounts → copy access_token")
-            print("   → Update FB_ACCESS_TOKEN secret in GitHub")
-        raise Exception(f"Container failed (code {code}): {msg}")
-    time.sleep(8)
-    r2 = requests.post(
-        f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish",
-        data={"creation_id": cid, "access_token": token}, timeout=30)
-    if "id" in r2.json():
-        print(f"✅ Single post live! ID: {r2.json()['id']}")
-    else:
-        raise Exception(f"Publish failed: {r2.json()}")
+def upload_image_to_ig(image_path, token):
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        
+        # Free public image host endpoint fallback pipeline
+        r = requests.post("https://api.imgbb.com/1/upload", 
+                          data={"key": "6af8ba4c11438a2e128527a29487c53d", "image": b64}, 
+                          timeout=30)
+        res = r.json()
+        if res.get("success"):
+            url = res["data"]["url"]
+            print(f"Hosted asset live URL link: {url}")
+            return url
+        print(f"ImgBB platform error: {res}")
+    except Exception as e:
+        print(f"Hosting structural engine failure: {e}")
+    return None
 
 
-def post_carousel(image_urls, caption, token):
-    print(f"Posting carousel ({len(image_urls)} slides)...")
-    child_ids = []
-    for i, url in enumerate(image_urls):
-        r = requests.post(
-            f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
-            data={"image_url": url, "is_carousel_item": "true", "access_token": token},
-            timeout=30)
-        cid = r.json().get("id")
-        if cid:
-            child_ids.append(cid)
-        else:
-            print(f"Slide {i+1} failed: {r.json()}")
-        time.sleep(3)
-    if len(child_ids) < 2:
-        print(f"⚠️ Only {len(child_ids)} slide(s) created — need at least 2 for carousel")
-        print("Attempting to post as single image instead...")
-        if child_ids:
-            # We have at least something — can't post single from carousel container
-            # Just skip gracefully
-            print("Skipping this carousel run — will retry next time")
-            return
-        return
-    r = requests.post(
-        f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media",
-        data={"media_type": "CAROUSEL", "children": ",".join(child_ids),
-              "caption": caption, "access_token": token}, timeout=30)
-    carid = r.json().get("id")
-    if not carid:
-        raise Exception(f"Carousel container failed: {r.json()}")
-    time.sleep(8)
-    r2 = requests.post(
-        f"https://graph.facebook.com/v25.0/{IG_ACCOUNT_ID}/media_publish",
-        data={"creation_id": carid, "access_token": token}, timeout=30)
-    if "id" in r2.json():
-        print(f"✅ Carousel live! ID: {r2.json()['id']}")
-    else:
-        raise Exception(f"Carousel publish failed: {r2.json()}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    RUN_START = time.time()
-    MAX_RUN_SECONDS = 240   # hard cap: 4 minutes per run = safe within free tier
-
-    def time_left():
-        return MAX_RUN_SECONDS - (time.time() - RUN_START)
-
-    def check_time(stage=""):
-        remaining = time_left()
-        print(f"⏱  Time used: {int(time.time()-RUN_START)}s | Remaining: {int(remaining)}s {stage}")
-        if remaining < 30:
-            print("⚠️  Time budget almost exhausted — posting what we have")
+def publish_single_post(img_url, caption, token):
+    print("Publishing Single Image Feed Media item post to Instagram...")
+    try:
+        url = f"https://graph.facebook.com/v18.0/{IG_ACCOUNT_ID}/media"
+        p = {"image_url": img_url, "caption": caption, "access_token": token}
+        r = requests.post(url, json=p, timeout=20)
+        c_id = r.json().get("id")
+        if not c_id:
+            print(f"Media Container Creation endpoint Error message: {r.text}")
             return False
-        return True
+            
+        # Broadcast media item live publish trigger
+        purl = f"https://graph.facebook.com/v18.0/{IG_ACCOUNT_ID}/media_publish"
+        r = requests.post(purl, json={"creation_id": c_id, "access_token": token}, timeout=20)
+        if "id" in r.json():
+            print("Successfully published Single Post straight to IG timeline feed!")
+            return True
+        print(f"Publish stage error outcome logs: {r.text}")
+    except Exception as e:
+        print(f"Publish post operation crashed: {e}")
+    return False
 
-    print(f"\n=== Bot started {datetime.now()} | Type: {POST_TYPE} ===")
-    print(f"=== Keys: GNews={'✅' if GNEWS_API_KEY else '❌'} | "
-          f"Gemini={'✅' if GEMINI_API_KEY else '❌'} | "
-          f"Gemini2={'✅' if os.environ.get('GEMINI_API_KEY_2') else '⚠️ not set'} | "
-          f"Unsplash={'✅' if UNSPLASH_ACCESS_KEY else '❌'} | "
-          f"Pexels={'✅' if PEXELS_API_KEY else '⚠️ not set'} | "
-          f"Pixabay={'✅' if PIXABAY_API_KEY else '⚠️ not set'} ===\n")
 
-    # Refresh FB token first (prevents the "session expired" error)
-    token = refresh_fb_token()
+def publish_carousel_post(slides_urls, caption, token):
+    print(f"Publishing multi-card Carousel Post consisting of ({len(slides_urls)} slides)...")
+    try:
+        child_ids = []
+        for index, surl in enumerate(slides_urls):
+            url = f"https://graph.facebook.com/v18.0/{IG_ACCOUNT_ID}/media"
+            p = {"image_url": surl, "is_carousel_item": True, "access_token": token}
+            r = requests.post(url, json=p, timeout=20)
+            cid = r.json().get("id")
+            if cid:
+                child_ids.append(cid)
+                print(f"Slide container index #{index+1} created ID string: {cid}")
+            else:
+                print(f"Failed to push slide item container asset index #{index+1}: {r.text}")
+                
+        if len(child_ids) < 2:
+            print("Aborting carousel pipeline — inadequate amount of clean children items generated.")
+            return False
+            
+        # Parent container grouping orchestration hook block
+        url = f"https://graph.facebook.com/v18.0/{IG_ACCOUNT_ID}/media"
+        p = {
+            "media_type": "CAROUSEL",
+            "children": child_ids,
+            "caption": caption,
+            "access_token": token
+        }
+        r = requests.post(url, json=p, timeout=25)
+        parent_id = r.json().get("id")
+        if not parent_id:
+            print(f"Carousel Parent Root Bundle Creation Error output: {r.text}")
+            return False
+            
+        purl = f"https://graph.facebook.com/v18.0/{IG_ACCOUNT_ID}/media_publish"
+        r = requests.post(purl, json={"creation_id": parent_id, "access_token": token}, timeout=25)
+        if "id" in r.json():
+            print("Successfully published Carousel Stack to Instagram dashboard!")
+            return True
+        print(f"Final carousel compilation broadcast release trigger error: {r.text}")
+    except Exception as e:
+        print(f"Carousel generation operation failure logs: {e}")
+    return False
 
-    if POST_TYPE == "carousel":
-        articles = fetch_articles(count=5)
-        if not articles:
-            print("⚠️ No articles found — skipping this run (will retry next scheduled time)")
-            sys.exit(0)
 
-        slide_paths = [create_cover_slide("/tmp/slide_0.jpg")]
-        carousel_captions = []
-
-        for i, article in enumerate(articles):
-            print(f"\n--- Slide {i+1}/5: {article['title'][:65]}...")
-            # ONE Gemini call covers keyword + AI prompt + slide caption
-            keyword, ai_prompt, summary, slide_cap = analyse_article(article, "carousel")
-            carousel_captions.append(slide_cap)
-            time.sleep(2)   # small pause between Gemini calls
-
-            img_path, img_src = fetch_image(keyword, ai_prompt, article,
-                                             f"/tmp/slide_img_{i}.jpg")
-            slide = create_news_slide(img_path, img_src, i+1,
-                                      article["title"],
-                                      article.get("description", ""),
-                                      article["source"]["name"],
-                                      f"/tmp/slide_{i+1}.jpg")
-            slide_paths.append(slide)
-
-        # ONE more Gemini call for the main carousel caption
-        time.sleep(5)
-        headlines = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(articles)])
-        cap_prompt = (
-            f"Write an Instagram carousel caption for @dailynewsflash_in (young Indians 18-35).\n"
-            f"Stories:\n{headlines}\n\n"
-            f"Structure:\n"
-            f"1. 🗞️ Hook: '5 stories India is ARGUING about right now 👇'\n"
-            f"2. One spicy teaser per story (1️⃣ to 5️⃣)\n"
-            f"3. 'Tell us which story made your blood boil 👇 Comment the number!'\n"
-            f"4. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n"
-            f"5. 25 trending hashtags\nUnder 2200 chars."
-        )
-        main_caption = call_gemini(cap_prompt) or "🗞️ Today's Top 5!\n\n👉 Follow @dailynewsflash_in\n\n#news #india"
-
-        print("\nUploading slides...")
-        urls = []
-        for path in slide_paths:
-            u = upload_to_imgur(path)
-            if u:
-                urls.append(u)
-            time.sleep(2)
-        if len(urls) < 2:
-            print("⚠️ Not enough images uploaded — skipping carousel this run")
-            sys.exit(0)
-        post_carousel(urls, main_caption, token)
-
+# ── Main Orchestrator Loop ───────────────────────────────────────────────────
+def main():
+    print(f"=== Startup Check: Time: {datetime.now().isoformat()} | Mode: {POST_TYPE.upper()} ===")
+    
+    active_token = refresh_fb_token_if_needed()
+    
+    # Process and target target payload volumes count arrays
+    fetch_count = 5 if POST_TYPE == "carousel" else 1
+    articles = fetch_articles(count=fetch_count)
+    if not articles:
+        print("Exit early: No valid automated targets scraped this round.")
+        sys.exit(0)
+        
+    compiled_dataset = []
+    
+    for idx, article in enumerate(articles):
+        print(f"\n--- Processing Entry item index #{idx+1} Title string: {article['title']} ---")
+        kw, ai_p, summary, caption = analyse_article(article, post_type=POST_TYPE)
+        
+        path_flag = f"/tmp/processed_asset_{idx}.jpg"
+        img_path, img_src = fetch_image(kw, ai_p, article, save_path=path_flag)
+        
+        if not img_path:
+            print("Critical step skipped: Failed fetching/generating visuals background asset layout structure.")
+            continue
+            
+        compiled_dataset.append((article, img_path, img_src, summary, caption))
+        
+    if not compiled_dataset:
+        print("Halt sequence execution workflow: Process queue containing zero completely rendered payloads.")
+        sys.exit(0)
+        
+    # ROUTE A: Run single isolated immediate timeline drop post
+    if POST_TYPE != "carousel":
+        article, img_path, img_src, summary, caption = compiled_dataset[0]
+        final_render = create_single_image(img_path, img_src, article["title"], article["source"]["name"], summary)
+        
+        live_web_url = upload_image_to_ig(final_render, active_token)
+        if live_web_url:
+            publish_single_post(live_web_url, caption, active_token)
+            
+    # ROUTE B: Run dynamic horizontal multi-carousel slide item drop bundle
     else:
-        articles = fetch_articles(count=1)
-        if not articles:
-            print("⚠️ No articles found — skipping this run (will retry next scheduled time)")
-            sys.exit(0)
-        article = articles[0]
-        print(f"\nArticle: {article['title']}")
-
-        # ONE Gemini call for everything
-        keyword, ai_prompt, summary, caption = analyse_article(article, "single")
-        img_path, img_src = fetch_image(keyword, ai_prompt, article)
-        final = create_single_image(img_path, img_src, article["title"],
-                                    article["source"]["name"], summary)
-        img_url = upload_to_imgur(final)
-        if not img_url:
-            print("⚠️ Image upload failed — skipping this run")
-            sys.exit(0)
-        post_single(img_url, caption, token)
-
-    print(f"\n=== ✅ Done at {datetime.now()} ===\n")
-
+        carousel_input_bundle = []
+        global_caption_blocks = []
+        
+        for idx, (article, img_path, img_src, summary, caption) in enumerate(compiled_dataset):
+            carousel_input_bundle.append((article, img_path, img_src, summary))
+            
+            # Formulate structured description block array item entry details strings
+            hook = f"Story #{idx+1}: {article['title']}"
+            global_caption_blocks.append(f"🚨 {hook}\n{caption}\n")
+            
+        # Compile global parent wrapper string data properties block
+        head_title_bar = f"⚡ DAILY NEWS FLASH BRIEFING • {datetime.now().strftime('%d %B %Y')}\n\n"
+        footer_hash_tags = (
+            "\n💬 Which story shocked you the most today? Drop your opinions below! 👇\n"
+            "👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n\n"
+            "#india #breakingnews #indianews #dailynewsflash #news #indiatoday #trending #viral"
+        )
+        unified_caption = head_title_bar + "\n".join(global_caption_blocks) + footer_hash_tags
+        
+        slide_disk_paths = create_carousel_slides(carousel_input_bundle)
+        
+        cloud_hosted_links = []
+        for idx, path in enumerate(slide_disk_paths):
+            h_url = upload_image_to_ig(path, active_token)
+            if h_url:
+                cloud_hosted_links.append(h_url)
+                
+        if len(cloud_hosted_links) >= 2:
+            publish_carousel_post(cloud_hosted_links, unified_caption, active_token)
+        else:
+            print("Pipeline aborted: Insufficient number of images successfully hosted online.")
+            
+    print("\n=== Automation Cycle Complete: Ending Process Cleanly ===")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"\n❌ Bot crashed: {e}")
-        import traceback
-        traceback.print_exc()
-        # Exit 0 so GitHub doesn't mark the scheduled run as "failed"
-        # The next scheduled run will try again automatically
-        sys.exit(0)
+    main()
