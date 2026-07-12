@@ -202,16 +202,17 @@ def _rule_ai_prompt(article):
 
 
 def _rule_summary(article):
+    """2-line summary shown ON the image card — use full description."""
     title = article["title"]
     desc  = article.get("description", "").strip()
     if desc and len(desc) > 30:
-        # Trim to ~40 words
+        # Use up to 55 words for the image card summary
         words = desc.split()
-        short = " ".join(words[:40])
-        if len(words) > 40:
+        short = " ".join(words[:55])
+        if len(words) > 55:
             short += "..."
         return short
-    return title + " — Read the full story in the caption below."
+    return title + " — Full details in caption."
 
 
 def _rule_caption(article):
@@ -223,8 +224,10 @@ def _rule_caption(article):
     # Pick hook based on topic
     if any(w in t for w in ["murder","kill","dead","rape","crime","arrest"]):
         hook = f"🚨 SHOCKING: {title}"
-        why  = "This case has shaken the nation and raised serious questions about public safety in India."
-        cta  = "💬 Should the punishment be stricter? Drop your opinion 👇"
+        why  = ("This case has shaken the nation and raised serious questions "
+                "about law enforcement and public safety across India. "
+                "Cases like this remind us that justice must be swift and certain.")
+        cta  = "💬 Should the punishment be stricter? What do YOU think should happen? Drop your opinion 👇"
         tags = "#india #crime #indianews #justice #breakingnews #viral #law #ndtv #shocking #IndiaNews #dailynewsflash #currentaffairs #trending #indiatoday #safetyIndia #crimeindia #news #bangalore #delhi #mumbai #policeindia #justiceforall #indianpolice #criminaljustice #outrage"
     elif any(w in t for w in ["cricket","ipl","t20","odi","test match","bcci","rohit","kohli","virat"]):
         hook = f"🏏 BIG NEWS: {title}"
@@ -267,8 +270,18 @@ def _rule_caption(article):
         cta  = "💬 What's your take? Comment below 👇"
         tags = "#india #breakingnews #indianews #dailynewsflash #news #indiatoday #ndtv #trending #viral #currentaffairs #latestnews #indiaupdates #newsindia #todaynews #flashnews #dailynews #newsupdate #topnews #indianmedia #newsflash #latestindia #indiaalert #breakingnewsindia #urgentindia #newsnow"
 
+    # Build key facts from description
+    facts = ""
+    if desc and len(desc) > 50:
+        sentences = [s.strip() for s in desc.replace("...", ".").split(".") if len(s.strip()) > 20]
+        if len(sentences) >= 2:
+            facts = f"\n\n🔍 KEY DETAILS:\n• {sentences[0]}."
+            if len(sentences) >= 3:
+                facts += f"\n• {sentences[1]}."
+
     return (f"{hook}\n\n"
-            f"📖 {desc}\n\n"
+            f"📖 WHAT HAPPENED:\n{desc}\n"
+            f"{facts}\n\n"
             f"{why}\n\n"
             f"{cta}\n"
             f"👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n\n"
@@ -297,16 +310,37 @@ End with: 📌 {src}"""
     else:
         caption_instruction = f"""CAPTION (full single-post caption):
 Structure:
-1. ONE punchy hook — 🔴 or 🚨 or ⚡ — the most shocking/controversial angle
-2. 📖 WHAT HAPPENED — 3-4 clear sentences: what, who, where, when, consequence
-3. 🤔 WHY IT MATTERS — 2 sentences why every Indian should care
-4. 🔥 THE CONTROVERSY — 1-2 sentences on what people argue about
-5. One hot-take line using Indian slang: "Yaar", "bhai", "sach mein"
-6. 📌 Source: {src}
-7. 💬 What's YOUR take? Drop your opinion below 👇 Don't hold back!
-8. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
-9. 25 relevant hashtags (English + Hindi)
-Rules: facts only, conversational, emojis throughout, 1800-2200 chars, make people WANT to comment."""
+1. ONE punchy hook — 🔴 BREAKING or 🚨 SHOCKING or ⚡ BIG NEWS
+
+2. 📖 THE FULL STORY — 5-6 sentences with ALL of these details if available:
+   - WHAT exactly happened (specific incident, not vague)
+   - WHO is involved (full names of victims, accused, officials — be specific)
+   - WHERE exactly (city, district, specific location like street/building/village)
+   - WHEN (date, time if known)
+   - HOW it happened (method, sequence of events)
+   - Current status (arrested? absconding? case filed? investigation ongoing?)
+
+3. 🔍 KEY FACTS — 2-3 bullet points with the most shocking specific details
+   • Use actual numbers, names, ages, locations from the article
+   • Example: "• Victim: Aarti Sharma, 11, from Murshidabad district"
+
+4. 🤔 WHY THIS MATTERS TO INDIA — 2 sentences connecting to bigger picture
+
+5. 🔥 PUBLIC REACTION — what are Indians saying? What's the controversy?
+
+6. Your hot take in Indian slang (Yaar / bhai / sach mein / desh ke log)
+
+7. 📌 Source: {src}
+8. 💬 Your reaction? Comment below — don't hold back! 👇
+9. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡
+10. 25 relevant hashtags
+
+CRITICAL RULES:
+- Use ONLY facts from the article — never invent names, ages, or details
+- Be specific: "11-year-old girl from Murshidabad" NOT "a young girl"
+- Be specific: "her body found in a pond in Nadia district" NOT "found dead"
+- Total length: 2000-2500 characters
+- Make every Indian who reads this feel something — anger, sadness, pride, shock"""
 
     prompt = f"""You are an expert Indian news Instagram editor.
 Analyse this news article and return EXACTLY four sections labelled as shown.
