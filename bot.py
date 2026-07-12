@@ -304,8 +304,12 @@ def analyse_article(article, post_type="single"):
     topic = article.get("_topic", "general")
 
     if post_type == "carousel":
-        caption_instruction = f"""CAPTION (carousel slide summary):
-Write 2-3 punchy sentences summarising this story for a carousel slide.
+        caption_instruction = f"""CAPTION (carousel slide text — appears ON the image):
+Write exactly 3 punchy sentences for this slide. Include:
+- Sentence 1: The most shocking/specific fact (with real name, place, number)
+- Sentence 2: Why it happened or what followed
+- Sentence 3: Why Indians should care or the controversy
+Keep it under 60 words total. Plain language. No emojis. Facts only.
 End with: 📌 {src}"""
     else:
         caption_instruction = f"""CAPTION (full single-post caption):
@@ -469,12 +473,19 @@ def _fetch_rss(url, source_name):
                     return ""
                 return block[s+len(t)+2:e].strip().replace("<![CDATA[","").replace("]]>","").strip()
             title = tag("title")
-            desc  = tag("description")[:300]
+            raw_desc = tag("description")
             link  = tag("link")
             if title and len(title) > 10:
+                # Strip all HTML tags from description
+                import re as _re
+                clean_desc = _re.sub(r"<[^>]+>", "", raw_desc)
+                clean_desc = clean_desc.replace("&lt;","<").replace("&gt;",">")
+                clean_desc = clean_desc.replace("&amp;","&").replace("&nbsp;"," ")
+                clean_desc = clean_desc.replace("&#39;","'").replace("&quot;",'"')
+                clean_desc = " ".join(clean_desc.split())[:300]
                 articles.append({
                     "title":       title,
-                    "description": desc,
+                    "description": clean_desc,
                     "url":         link,
                     "source":      {"name": source_name},
                     "_topic":      "general",
@@ -854,14 +865,19 @@ def create_single_image(image_path, image_source, headline, source_name,
         draw.text((22, y), line, font=f["head"], fill=(255, 255, 255))
         y += 64
 
-    # Brief summary on card — the key fix
+    # Brief summary on card
     if summary:
-        y += 8
-        draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))  # thin red divider
-        y += 10
-        for line in textwrap.wrap(summary, width=42)[:3]:
-            draw.text((22, y), line, font=f["small"], fill=(210, 210, 210))
-            y += 36
+        import re as _re3
+        clean_sum = _re3.sub(r"<[^>]+>", "", summary)
+        clean_sum = clean_sum.replace("&lt;","<").replace("&gt;",">").replace("&amp;","&").replace("&nbsp;"," ")
+        clean_sum = " ".join(clean_sum.split())
+        if clean_sum:
+            y += 8
+            draw.rectangle([(0, y-4), (1080, y-2)], fill=(220, 30, 30))  # thin red divider
+            y += 10
+            for line in textwrap.wrap(clean_sum, width=42)[:3]:
+                draw.text((22, y), line, font=f["small"], fill=(210, 210, 210))
+                y += 36
 
     draw.rectangle([(0, 1022), (1080, 1080)], fill=(12, 12, 12))
     draw.text((22, 1036), "👉 Follow @dailynewsflash_in for daily updates",
@@ -917,11 +933,16 @@ def create_news_slide(image_path, image_source, number, headline,
         draw.text((28, y), line, font=f["head"], fill=(255, 255, 255))
         y += 64
     if description:
-        short = description[:220] + "..." if len(description) > 220 else description
-        y += 18
-        for line in textwrap.wrap(short, width=44)[:4]:
-            draw.text((28, y), line, font=f["body"], fill=(215, 215, 215))
-            y += 40
+        import re as _re2
+        clean = _re2.sub(r"<[^>]+>", "", description)
+        clean = clean.replace("&lt;","<").replace("&gt;",">").replace("&amp;","&").replace("&nbsp;"," ")
+        clean = " ".join(clean.split())
+        short = clean[:220] + "..." if len(clean) > 220 else clean
+        if short.strip():
+            y += 18
+            for line in textwrap.wrap(short, width=44)[:4]:
+                draw.text((28, y), line, font=f["body"], fill=(215, 215, 215))
+                y += 40
     draw.text((28, 900),  f"📌 {source}",           font=f["small"], fill=(100, 190, 255))
     draw.text((28, 945),  "Swipe for more →",         font=f["small"], fill=(155, 155, 210))
     draw.text((28, 993),  "👉 Follow @dailynewsflash_in", font=f["small"], fill=(255, 200, 50))
@@ -1157,17 +1178,50 @@ def main():
         # ONE more Gemini call for the main carousel caption
         time.sleep(5)
         headlines = "\n".join([f"{i+1}. {a['title']}" for i, a in enumerate(articles)])
+        # Include descriptions for richer caption
+        story_details = ""
+        for idx, art in enumerate(articles[:5]):
+            desc = art.get("description","")[:120]
+            story_details += f"\n{idx+1}. {art['title']}"
+            if desc:
+                story_details += f"\n   Context: {desc}"
+
         cap_prompt = (
-            f"Write an Instagram carousel caption for @dailynewsflash_in (young Indians 18-35).\n"
-            f"Stories:\n{headlines}\n\n"
+            f"Write a viral Instagram carousel caption for @dailynewsflash_in (Indians 18-35).\n"
+            f"Stories with context:\n{story_details}\n\n"
             f"Structure:\n"
-            f"1. 🗞️ Hook: '5 stories India is ARGUING about right now 👇'\n"
-            f"2. One spicy teaser per story (1️⃣ to 5️⃣)\n"
-            f"3. 'Tell us which story made your blood boil 👇 Comment the number!'\n"
-            f"4. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n"
-            f"5. 25 trending hashtags\nUnder 2200 chars."
+            f"1. 🗞️ Hook: '5 stories rocking India right NOW — swipe before you miss them! 👇'\n"
+            f"2. For each story write ONE punchy line with the most shocking angle:\n"
+            f"   1️⃣ [story 1 — include specific name/place/number if available]\n"
+            f"   2️⃣ [story 2 — include specific name/place/number if available]\n"
+            f"   3️⃣ [story 3 — include specific name/place/number if available]\n"
+            f"   4️⃣ [story 4 — include specific name/place/number if available]\n"
+            f"   5️⃣ [story 5 — include specific name/place/number if available]\n"
+            f"3. 'Which story made your jaw drop? Comment the number! 👇'\n"
+            f"4. 💬 Tell us your HOT TAKE — we read every comment!\n"
+            f"5. 👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n"
+            f"6. 25 trending hashtags mixing topic-specific and general India tags\n"
+            f"Under 2200 chars. Make it IMPOSSIBLE not to swipe and comment."
         )
-        main_caption = call_gemini(cap_prompt) or "🗞️ Today's Top 5!\n\n👉 Follow @dailynewsflash_in\n\n#news #india"
+        main_caption = call_gemini(cap_prompt)
+        if not main_caption:
+            # Rich rule-based carousel caption
+            teasers = ""
+            emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
+            for idx, art in enumerate(articles[:5]):
+                t = art["title"]
+                teasers += f"\n{emojis[idx]} {t}"
+            main_caption = (
+                f"🗞️ 5 stories India is talking about RIGHT NOW 👇\n"
+                f"Swipe through — don\'t miss a single one!\n"
+                f"{teasers}\n\n"
+                f"💬 Which story shocked you the most? Comment the number below! 👇\n"
+                f"👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n\n"
+                f"#india #breakingnews #indianews #dailynewsflash #news "
+                f"#indiatoday #ndtv #trending #viral #currentaffairs "
+                f"#top5news #indiaupdates #latestnews #todaynews #newsflash "
+                f"#indianmedia #newsindia #dailynews #topstories #newsupdate"
+            )
 
         print("\nUploading slides...")
         urls = []
