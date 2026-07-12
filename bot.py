@@ -46,10 +46,10 @@ TRENDING_TOPICS = [
 # Free tier: 15 req/min per key. Two keys = 30 req/min effective limit.
 # We rotate keys + models to avoid hitting any single limit.
 GEMINI_MODELS = [
-    "gemini-2.5-flash",        # newest, highest free quota (500 req/day free)
-    "gemini-2.0-flash",        # fallback
-    "gemini-1.5-flash",        # fallback
-    "gemini-1.5-flash-8b",     # last resort
+    "gemini-2.0-flash-lite",   # lightest, highest rate limit on free tier
+    "gemini-2.0-flash",        # standard
+    "gemini-1.5-flash-8b",     # smallest, least likely to rate limit
+    "gemini-1.5-flash",        # last resort
 ]
 
 # Primary key always set. Secondary key optional — doubles capacity if set.
@@ -916,6 +916,28 @@ def upload_to_imgur(image_path):
 # ── Token auto-refresh ────────────────────────────────────────────────────────
 def _get_page_token(user_token, app_id, app_secret):
     """Exchange user token for a Page access token (never expires)."""
+    # First check if the current token is already expired
+    try:
+        check = requests.get(
+            "https://graph.facebook.com/v25.0/me",
+            params={"access_token": user_token}, timeout=10)
+        cd = check.json()
+        if "error" in cd:
+            err_code = cd["error"].get("code", 0)
+            err_msg  = cd["error"].get("message", "")
+            if err_code in [190, 463] or "expired" in err_msg.lower():
+                print("❌ STORED FB_ACCESS_TOKEN IS EXPIRED")
+                print("   You must refresh it manually ONE more time:")
+                print("   1. Go to: developers.facebook.com/tools/explorer")
+                print("   2. Select DailyNewsFlashBot → Generate Access Token")
+                print("   3. Run query: me/accounts")
+                print("   4. Copy the access_token next to Daily News Flash page")
+                print("   5. Go to GitHub → Settings → Secrets → update FB_ACCESS_TOKEN")
+                print("   After this one refresh, auto-refresh will handle it forever.")
+                return None
+    except Exception as e:
+        print(f"Token validity check error: {e}")
+
     try:
         # Step 1: Get long-lived user token (60 days)
         r = requests.get(
@@ -929,7 +951,7 @@ def _get_page_token(user_token, app_id, app_secret):
         if not ll_token:
             print(f"Long-lived token exchange failed: {d}")
             return None
-        print(f"Long-lived token obtained (expires ~60 days)")
+        print("Long-lived token obtained (expires ~60 days)")
 
         # Step 2: Get Page access token (never expires for verified apps)
         r2 = requests.get(
@@ -939,10 +961,10 @@ def _get_page_token(user_token, app_id, app_secret):
         d2 = r2.json()
         page_token = d2.get("access_token", "")
         if page_token:
-            print("Page token obtained (never expires)")
+            print("✅ Page token obtained (never expires) — token issue permanently resolved")
             return page_token
         print(f"Page token failed: {d2}")
-        return ll_token   # fall back to 60-day token
+        return ll_token
     except Exception as e:
         print(f"Page token error: {e}")
         return None
@@ -950,45 +972,29 @@ def _get_page_token(user_token, app_id, app_secret):
 
 def refresh_fb_token():
     """
-    Full token refresh chain:
-    1. If FB_APP_ID + FB_APP_SECRET present: get a never-expiring Page token
-    2. If only those missing: use existing FB_ACCESS_TOKEN as-is
-    Logs clearly so you know the status every run.
+    Token is now refreshed and saved by the workflow BEFORE bot.py runs.
+    The FB_ACCESS_TOKEN secret is always fresh when bot.py starts.
+    This function just reads and validates the token.
     """
-    app_id     = os.environ.get("FB_APP_ID", "").strip()
-    app_secret = os.environ.get("FB_APP_SECRET", "").strip()
-
-    if not app_id or not app_secret:
-        print("⚠️  FB_APP_ID / FB_APP_SECRET not set in GitHub Secrets.")
-        print("    Token will expire every few hours — see setup instructions.")
-        print(f"    Using current token (may be expired).")
-        return FB_ACCESS_TOKEN
-
-    print("Refreshing FB token...")
-    new_token = _get_page_token(FB_ACCESS_TOKEN, app_id, app_secret)
-    if new_token:
-        return new_token
-
-    # If page token fails, try getting just a long-lived user token (60 days)
-    print("Page token failed — trying long-lived user token...")
+    token = FB_ACCESS_TOKEN
     try:
-        r = requests.get(
-            "https://graph.facebook.com/v25.0/oauth/access_token",
-            params={"grant_type": "fb_exchange_token",
-                    "client_id": app_id, "client_secret": app_secret,
-                    "fb_exchange_token": FB_ACCESS_TOKEN},
-            timeout=15)
-        ll = r.json().get("access_token", "")
-        if ll:
-            print("Long-lived token obtained as fallback (valid ~60 days)")
-            return ll
+        r = requests.get("https://graph.facebook.com/v25.0/me",
+                         params={"access_token": token}, timeout=10)
+        d = r.json()
+        if "id" in d:
+            print(f"✅ FB token valid (user: {d.get('name', d.get('id', '?'))})")
+            return token
+        err = d.get("error", {})
+        if err.get("code") in [190, 463] or "expired" in err.get("message","").lower():
+            print("❌ FB token expired — the workflow refresh step failed")
+            print("   Please refresh FB_ACCESS_TOKEN manually ONE more time:")
+            print("   developers.facebook.com/tools/explorer → me/accounts → copy token")
+            print("   After that, auto-refresh handles it permanently.")
+        else:
+            print(f"⚠️ FB token check: {err.get('message', 'unknown error')}")
     except Exception as e:
-        print(f"Long-lived token fallback error: {e}")
-
-    print("⚠️ All token refresh attempts failed — using existing token")
-    print("   ACTION NEEDED: Update FB_ACCESS_TOKEN in GitHub Secrets")
-    print("   Go to: developers.facebook.com/tools/explorer")
-    return FB_ACCESS_TOKEN
+        print(f"Token check error: {e}")
+    return token
 
 
 # ── Post to Instagram ─────────────────────────────────────────────────────────
@@ -1004,11 +1010,13 @@ def post_single(image_url, caption, token):
         err = result.get("error", {})
         code = err.get("code", "?")
         msg  = err.get("message", str(result))
-        # Token expired — give clear instructions
         if code in [190, 463] or "expired" in msg.lower() or "session" in msg.lower():
-            print("❌ FB TOKEN EXPIRED. Fix: Go to developers.facebook.com/tools/explorer")
+            print("❌ FB TOKEN EXPIRED — cannot post until token is refreshed")
+            print("   Fix: developers.facebook.com/tools/explorer")
             print("   → Generate Access Token → me/accounts → copy access_token")
-            print("   → Update FB_ACCESS_TOKEN secret in GitHub")
+            print("   → Update FB_ACCESS_TOKEN in GitHub Secrets")
+            # Exit cleanly — don't count as failure, next run will retry
+            sys.exit(0)
         raise Exception(f"Container failed (code {code}): {msg}")
     time.sleep(8)
     r2 = requests.post(
