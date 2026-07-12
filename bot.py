@@ -46,9 +46,10 @@ TRENDING_TOPICS = [
 # Free tier: 15 req/min per key. Two keys = 30 req/min effective limit.
 # We rotate keys + models to avoid hitting any single limit.
 GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
+    "gemini-2.5-flash",        # newest, highest free quota (500 req/day free)
+    "gemini-2.0-flash",        # fallback
+    "gemini-1.5-flash",        # fallback
+    "gemini-1.5-flash-8b",     # last resort
 ]
 
 # Primary key always set. Secondary key optional — doubles capacity if set.
@@ -215,15 +216,64 @@ def _rule_summary(article):
 
 def _rule_caption(article):
     title = article["title"]
-    desc  = article.get("description", "")
+    desc  = article.get("description", "").strip()
     src   = article["source"]["name"]
-    return (f"⚡ {title}\n\n"
-            f"{desc}\n\n"
-            f"📌 Source: {src}\n\n"
-            f"💬 What do YOU think? Comment below 👇\n"
+    t     = title.lower()
+
+    # Pick hook based on topic
+    if any(w in t for w in ["murder","kill","dead","rape","crime","arrest"]):
+        hook = f"🚨 SHOCKING: {title}"
+        why  = "This case has shaken the nation and raised serious questions about public safety in India."
+        cta  = "💬 Should the punishment be stricter? Drop your opinion 👇"
+        tags = "#india #crime #indianews #justice #breakingnews #viral #law #ndtv #shocking #IndiaNews #dailynewsflash #currentaffairs #trending #indiatoday #safetyIndia #crimeindia #news #bangalore #delhi #mumbai #policeindia #justiceforall #indianpolice #criminaljustice #outrage"
+    elif any(w in t for w in ["cricket","ipl","t20","odi","test match","bcci","rohit","kohli","virat"]):
+        hook = f"🏏 BIG NEWS: {title}"
+        why  = "Indian cricket fans across the country are reacting to this — and opinions are divided!"
+        cta  = "💬 What do you think about the team's performance? Comment below 👇"
+        tags = "#cricket #india #ipl #t20 #teamIndia #bcci #breakingnews #cricketlovers #indiancricket #viratkohli #rohitsharma #ipl2026 #t20worldcup #dailynewsflash #cricketfans #indiacricket #cricketindia #hitman #cricketnews #sports #trending #viral #sportsnews #indianews #news"
+    elif any(w in t for w in ["court","verdict","sc","cbi","ed","bail","judge","law","high court"]):
+        hook = f"⚖️ BREAKING VERDICT: {title}"
+        why  = "This ruling could set a major precedent for how similar cases are handled across India."
+        cta  = "💬 Do you agree with this verdict? Let us know 👇"
+        tags = "#india #supremecourt #verdict #law #justice #breakingnews #indianews #cbi #highcourt #legalindia #dailynewsflash #trending #viral #news #currentaffairs #judiciary #indianlaw #lawandorder #courtverdict #indialegal #ndtv #indiatoday #legal #supremecourtofindia #justiceindia"
+    elif any(w in t for w in ["isro","rocket","space","satellite","moon","chandrayaan","gaganyaan"]):
+        hook = f"🚀 INDIA IN SPACE: {title}"
+        why  = "This is a proud moment for every Indian — ISRO continues to make the nation shine on the global stage!"
+        cta  = "💬 Proud of ISRO? Show your support 🇮🇳 Comment below!"
+        tags = "#isro #india #space #rocket #chandrayaan #gaganyaan #science #technology #breakingnews #indianews #proudlyindian #spaceindia #isroindia #dailynewsflash #trending #viral #news #spaceexploration #indianscience #techindia #sciencenews #isronews #indiaspace #moonsion #currentaffairs"
+    elif any(w in t for w in ["modi","bjp","congress","parliament","election","government","minister"]):
+        hook = f"🔴 POLITICAL BOMBSHELL: {title}"
+        why  = "This political development is being discussed across India and could impact millions of citizens."
+        cta  = "💬 What's your take on this? No filter — comment below! 👇"
+        tags = "#india #politics #modi #bjp #congress #breakingnews #indianews #parliament #election #government #dailynewsflash #trending #viral #news #currentaffairs #indianpolitics #politicsnews #indiaelection #ndtv #indiatoday #politicalindia #bjpindia #congressindia #rahulgandhi #narendramodi"
+    elif any(w in t for w in ["bollywood","film","movie","actor","actress","celebrity","star","ott"]):
+        hook = f"🎬 BOLLYWOOD BUZZ: {title}"
+        why  = "The entire film industry and fans are talking about this right now!"
+        cta  = "💬 What's your reaction? Comment below 👇"
+        tags = "#bollywood #india #entertainment #film #movies #breakingnews #celebrity #indianews #dailynewsflash #trending #viral #news #bollywoodgossip #filmyindia #ott #bollywoodfans #starnews #actornews #actressnews #mumbaifilm #hindimovies #filmfare #bollywoodnews #entertainment #indiaentertainment"
+    elif any(w in t for w in ["flood","earthquake","cyclone","disaster","rain","landslide","storm"]):
+        hook = f"⚠️ DISASTER ALERT: {title}"
+        why  = "Millions of Indians are affected by this disaster. Our thoughts are with those impacted."
+        cta  = "💬 Stay safe everyone. Share this to spread awareness 👇"
+        tags = "#india #disaster #flood #earthquake #breakingnews #indianews #naturaldisaster #disasterrelief #dailynewsflash #trending #viral #news #currentaffairs #ndrf #indiadisaster #climatechange #weatherindia #floodindia #cycloneindia #staysafe #emergencyindia #rescueoperation #disasternews #helpindia #ndtv"
+    elif any(w in t for w in ["economy","inflation","rupee","rbi","budget","gdp","stock","market","price"]):
+        hook = f"📉 ECONOMY ALERT: {title}"
+        why  = "This directly affects your wallet, your savings, and the daily life of every Indian household."
+        cta  = "💬 Are you feeling the impact? Tell us below 👇"
+        tags = "#india #economy #inflation #rupee #rbi #budget #breakingnews #indianews #dailynewsflash #trending #viral #news #currentaffairs #stockmarket #finance #moneyindia #indianeconomy #financenews #businessindia #rupeefall #petrolprice #sensex #nifty #economynews #indianfinance"
+    else:
+        hook = f"⚡ BREAKING: {title}"
+        why  = "This is one of the most talked-about stories in India right now."
+        cta  = "💬 What's your take? Comment below 👇"
+        tags = "#india #breakingnews #indianews #dailynewsflash #news #indiatoday #ndtv #trending #viral #currentaffairs #latestnews #indiaupdates #newsindia #todaynews #flashnews #dailynews #newsupdate #topnews #indianmedia #newsflash #latestindia #indiaalert #breakingnewsindia #urgentindia #newsnow"
+
+    return (f"{hook}\n\n"
+            f"📖 {desc}\n\n"
+            f"{why}\n\n"
+            f"{cta}\n"
             f"👉 Follow @dailynewsflash_in — Flash news. Zero fluff. ⚡\n\n"
-            f"#india #breakingnews #indianews #dailynewsflash #news "
-            f"#indiatoday #ndtv #trending #viral #currentaffairs")
+            f"📌 Source: {src}\n\n"
+            f"{tags}")
 
 
 # ── ONE combined Gemini call per article (saves quota) ────────────────────────
@@ -349,12 +399,23 @@ CAPTION:
 
 # ── Free RSS feeds — unlimited, no API key ────────────────────────────────────
 RSS_FEEDS = [
-    ("https://feeds.feedburner.com/ndtvnews-top-stories",         "NDTV"),
-    ("https://timesofindia.indiatimes.com/rssfeedstopstories.cms","Times of India"),
-    ("https://www.thehindu.com/news/feeder/default.rss",          "The Hindu"),
-    ("https://indianexpress.com/feed/",                           "Indian Express"),
+    # National Indian outlets
+    ("https://feeds.feedburner.com/ndtvnews-top-stories",              "NDTV"),
+    ("https://timesofindia.indiatimes.com/rssfeedstopstories.cms",     "Times of India"),
+    ("https://www.thehindu.com/news/feeder/default.rss",               "The Hindu"),
+    ("https://indianexpress.com/feed/",                                "Indian Express"),
     ("https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml","Hindustan Times"),
-    ("https://feeds.bbci.co.uk/news/world/asia/india/rss.xml",    "BBC India"),
+    ("https://feeds.bbci.co.uk/news/world/asia/india/rss.xml",        "BBC India"),
+    # Sports & Cricket
+    ("https://timesofindia.indiatimes.com/rssfeeds/4719148.cms",       "TOI Sports"),
+    ("https://www.espncricinfo.com/rss/content/story/feeds/0.xml",     "ESPNcricinfo"),
+    # Business & Economy
+    ("https://economictimes.indiatimes.com/rssfeedstopstories.cms",    "Economic Times"),
+    ("https://www.moneycontrol.com/rss/latestnews.xml",                "Moneycontrol"),
+    # Entertainment
+    ("https://timesofindia.indiatimes.com/rssfeeds/1081479906.cms",    "TOI Entertainment"),
+    # Science & Tech
+    ("https://feeds.feedburner.com/gadgets360-latest",                 "Gadgets360"),
 ]
 
 def _fetch_rss(url, source_name):
@@ -438,7 +499,7 @@ def fetch_articles(count=5):
 
     # RSS supplement — always run, free, no quota
     print("Loading RSS feeds...")
-    feeds = random.sample(RSS_FEEDS, min(3, len(RSS_FEEDS)))
+    feeds = random.sample(RSS_FEEDS, min(6, len(RSS_FEEDS)))
     for feed_url, feed_name in feeds:
         all_articles.extend(_fetch_rss(feed_url, feed_name))
 
@@ -520,6 +581,37 @@ def fetch_articles(count=5):
 
 
 # ── Image: try 3 real sources then AI fallback ────────────────────────────────
+def _try_wikimedia(keyword):
+    """Wikimedia Commons — completely free, no key, millions of images."""
+    try:
+        url = "https://commons.wikimedia.org/w/api.php"
+        params = {
+            "action": "query", "format": "json",
+            "generator": "search", "gsrsearch": f"file:{keyword}",
+            "gsrnamespace": 6, "gsrlimit": 10,
+            "prop": "imageinfo", "iiprop": "url|size|mediatype",
+            "iiurlwidth": 1080,
+        }
+        r = requests.get(url, params=params, timeout=10,
+                         headers={"User-Agent": "DailyNewsFlashBot/1.0"})
+        pages = r.json().get("query", {}).get("pages", {})
+        candidates = []
+        for page in pages.values():
+            ii = page.get("imageinfo", [{}])[0]
+            img_url = ii.get("thumburl") or ii.get("url", "")
+            w = ii.get("thumbwidth", 0) or ii.get("width", 0)
+            h = ii.get("thumbheight", 0) or ii.get("height", 0)
+            media = ii.get("mediatype", "")
+            if img_url and "BITMAP" in media and w >= 500 and h >= 400:
+                candidates.append(img_url)
+        if candidates:
+            print(f"Wikimedia: {len(candidates)} images for '{keyword}'")
+            return random.choice(candidates)
+    except Exception as e:
+        print(f"Wikimedia error: {e}")
+    return None
+
+
 def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
     candidates = []
 
@@ -588,6 +680,27 @@ def fetch_image(keyword, ai_prompt, article, save_path="/tmp/img.jpg"):
                     print(f"Rejected image: too small or wrong ratio ({w}x{h})")
         except Exception as e:
             print(f"Photo download error: {e}")
+
+    # Wikimedia Commons fallback — free, no key, huge library
+    wiki_url = _try_wikimedia(keyword)
+    if not wiki_url and " " in keyword:
+        # Try simpler single-word version
+        wiki_url = _try_wikimedia(keyword.split()[0])
+    if wiki_url:
+        try:
+            r = requests.get(wiki_url, stream=True, timeout=20,
+                             headers={"User-Agent": "DailyNewsFlashBot/1.0"})
+            if r.status_code == 200:
+                with open(save_path, "wb") as f:
+                    for chunk in r.iter_content(4096):
+                        f.write(chunk)
+                img = Image.open(save_path)
+                w, h = img.size
+                if w >= 400 and h >= 300:
+                    print(f"Wikimedia image OK ({w}x{h})")
+                    return save_path, "Wikimedia"
+        except Exception as e:
+            print(f"Wikimedia download error: {e}")
 
     # AI fallback — Pollinations (free, no key)
     print("Generating AI image via Pollinations...")
