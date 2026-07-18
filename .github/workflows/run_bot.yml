@@ -2,28 +2,18 @@ name: Instagram News Bot
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # 9:30 AM IST  — single post
-    - cron: '0 7 * * *'    # 12:30 PM IST — carousel post
-    - cron: '0 10 * * *'   # 3:30 PM IST  — single post
-    - cron: '0 13 * * *'   # 6:30 PM IST  — carousel post
-    - cron: '0 16 * * *'   # 9:30 PM IST  — single post
+    - cron: '0 4 * * *'    # 9:30 AM IST
+    - cron: '0 7 * * *'    # 12:30 PM IST
+    - cron: '0 10 * * *'   # 3:30 PM IST
+    - cron: '0 13 * * *'   # 6:30 PM IST
+    - cron: '0 16 * * *'   # 9:30 PM IST
   workflow_dispatch:
-    inputs:
-      post_type:
-        description: 'Post type (single or carousel)'
-        required: true
-        default: 'single'
-        type: choice
-        options:
-          - single
-          - carousel
 
 jobs:
   post:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write
 
     steps:
       - uses: actions/checkout@v3
@@ -33,131 +23,17 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests pillow
+        run: pip install requests pillow PyNaCl
 
-      - name: Decide post type
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "POST_TYPE=${{ github.event.inputs.post_type }}" >> $GITHUB_ENV
-          elif [ "${{ github.event.schedule }}" = "0 7 * * *" ] || \
-               [ "${{ github.event.schedule }}" = "0 13 * * *" ]; then
-            echo "POST_TYPE=carousel" >> $GITHUB_ENV
-          else
-            echo "POST_TYPE=single" >> $GITHUB_ENV
-          fi
-
-      # ── Refresh FB token and save it back to GitHub Secrets automatically ──
-      - name: Refresh and save FB token
+      - name: Refresh FB token and save to secrets
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           FB_APP_ID:       ${{ secrets.FB_APP_ID }}
           FB_APP_SECRET:   ${{ secrets.FB_APP_SECRET }}
           FB_PAGE_ID:      ${{ secrets.FB_PAGE_ID }}
-          GH_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:        ${{ secrets.PAT_TOKEN }}
           GH_REPO:         ${{ github.repository }}
-        run: |
-          python3 << 'PYEOF'
-          import os, requests, json, base64
-
-          token      = os.environ.get("FB_ACCESS_TOKEN", "").strip()
-          app_id     = os.environ.get("FB_APP_ID", "").strip()
-          app_secret = os.environ.get("FB_APP_SECRET", "").strip()
-          page_id    = os.environ.get("FB_PAGE_ID", "").strip()
-          gh_token   = os.environ.get("GH_TOKEN", "").strip()
-          gh_repo    = os.environ.get("GH_REPO", "").strip()
-
-          if not all([token, app_id, app_secret, page_id, gh_token]):
-              print("Missing credentials — skipping token refresh")
-              exit(0)
-
-          def save_secret(name, value):
-              """Save a secret to GitHub Secrets via API."""
-              # Get repo public key for encryption
-              key_resp = requests.get(
-                  f"https://api.github.com/repos/{gh_repo}/actions/secrets/public-key",
-                  headers={"Authorization": f"Bearer {gh_token}",
-                           "Accept": "application/vnd.github+json"}
-              )
-              if key_resp.status_code != 200:
-                  print(f"Cannot get public key: {key_resp.text}")
-                  return False
-
-              key_data = key_resp.json()
-              pub_key  = key_data["key"]
-              key_id   = key_data["key_id"]
-
-              # Encrypt the secret using libsodium (PyNaCl)
-              try:
-                  from nacl import encoding, public as nacl_public
-                  pub_key_bytes = base64.b64decode(pub_key)
-                  sealed = nacl_public.SealedBox(
-                      nacl_public.PublicKey(pub_key_bytes)
-                  ).encrypt(value.encode("utf-8"))
-                  encrypted = base64.b64encode(sealed).decode("utf-8")
-              except ImportError:
-                  # PyNaCl not available — use simple base64 workaround
-                  # GitHub requires proper encryption, so install it first
-                  import subprocess
-                  subprocess.run(["pip", "install", "PyNaCl", "-q"])
-                  from nacl import encoding, public as nacl_public
-                  pub_key_bytes = base64.b64decode(pub_key)
-                  sealed = nacl_public.SealedBox(
-                      nacl_public.PublicKey(pub_key_bytes)
-                  ).encrypt(value.encode("utf-8"))
-                  encrypted = base64.b64encode(sealed).decode("utf-8")
-
-              # Save to GitHub Secrets
-              resp = requests.put(
-                  f"https://api.github.com/repos/{gh_repo}/actions/secrets/{name}",
-                  headers={"Authorization": f"Bearer {gh_token}",
-                           "Accept": "application/vnd.github+json"},
-                  json={"encrypted_value": encrypted, "key_id": key_id}
-              )
-              if resp.status_code in [201, 204]:
-                  print(f"✅ Secret {name} saved to GitHub")
-                  return True
-              print(f"Failed to save {name}: {resp.status_code} {resp.text}")
-              return False
-
-          # Step 1: Check if current token is still valid
-          check = requests.get("https://graph.facebook.com/v25.0/me",
-                               params={"access_token": token}, timeout=10)
-          if check.status_code == 200 and "id" in check.json():
-              print("Current token is valid — refreshing to extend lifetime...")
-          else:
-              print(f"⚠️  Token check: {check.json().get('error',{}).get('message','unknown')}")
-              print("Token may be expired. Attempting exchange anyway...")
-
-          # Step 2: Exchange for long-lived user token (60 days)
-          r = requests.get(
-              "https://graph.facebook.com/v25.0/oauth/access_token",
-              params={"grant_type": "fb_exchange_token",
-                      "client_id": app_id, "client_secret": app_secret,
-                      "fb_exchange_token": token}, timeout=15)
-          d = r.json()
-          ll_token = d.get("access_token", "")
-          if not ll_token:
-              print(f"Long-lived exchange failed: {d.get('error',{}).get('message','')}")
-              print("Continuing with existing token...")
-              exit(0)
-          print(f"Long-lived token obtained (valid ~60 days)")
-
-          # Step 3: Get Page access token (never expires)
-          r2 = requests.get(
-              f"https://graph.facebook.com/v25.0/{page_id}",
-              params={"fields": "access_token", "access_token": ll_token},
-              timeout=15)
-          d2 = r2.json()
-          page_token = d2.get("access_token", ll_token)
-          if "access_token" in d2:
-              print("Page token obtained (never expires)")
-          else:
-              print(f"Page token unavailable ({d2.get('error',{}).get('message','')}), using long-lived token")
-
-          # Step 4: Save the new token back to GitHub Secrets
-          save_secret("FB_ACCESS_TOKEN", page_token)
-          print("Token refresh complete — GitHub secret updated automatically")
-          PYEOF
+        run: python3 refresh_token.py
 
       - name: Run bot
         env:
@@ -172,4 +48,4 @@ jobs:
           PIXABAY_API_KEY:     ${{ secrets.PIXABAY_API_KEY }}
           FB_APP_ID:           ${{ secrets.FB_APP_ID }}
           FB_APP_SECRET:       ${{ secrets.FB_APP_SECRET }}
-        run: python bot.py
+        run: python3 bot.py
